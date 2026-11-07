@@ -856,6 +856,28 @@ test "sidebar: Slack's top rows, Starred, custom sections and Apps in order" {
     try std.testing.expect(!t.hasText("Coming soon"));
 }
 
+test "sidebar: your own DM comes first in Starred" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    try st.apply(.{ .channels = &.{
+        .{ .id = "C1", .name = "general", .kind = .channel, .place = .starred },
+        .{ .id = "D1", .name = "", .kind = .im, .user_id = "U2", .place = .starred },
+        .{ .id = "D0", .name = "", .kind = .im, .user_id = "U1", .place = .starred },
+    } });
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 900, .scale = 1 });
+    defer t.deinit();
+    for (0..4) |_| t.frame();
+    const me = t.findText("Alex").?.y;
+    try std.testing.expect(me > t.findText("Starred").?.y);
+    try std.testing.expect(me < t.findText("general").?.y);
+    try std.testing.expect(me < t.findText("Grace").?.y);
+}
+
 test "threads page: loads on open, lists a thread, opens it" {
     const gpa = std.testing.allocator;
     var st = store.Store.init(gpa);

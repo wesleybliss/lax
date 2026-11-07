@@ -531,6 +531,13 @@ pub const Store = struct {
         return c.name;
     }
 
+    /// Your own DM (Slack's "you" conversation)
+    pub fn isSelfDm(s: *const Store, c: *const Channel) bool {
+        if (c.kind != .im) return false;
+        const uid = c.user_id orelse return false;
+        return s.self_id.len > 0 and std.mem.eql(u8, uid, s.self_id);
+    }
+
     /// A DM with an app or bot (listed under Apps)
     pub fn isApp(s: *const Store, c: *const Channel) bool {
         if (c.kind != .im) return false;

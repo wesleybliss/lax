@@ -848,6 +848,12 @@ pub const State = struct {
             fn byName(x: @This(), a: *store.Channel, b: *store.Channel) bool {
                 return std.ascii.lessThanIgnoreCase(x.st.channelName(a), x.st.channelName(b));
             }
+            fn starredFirst(x: @This(), a: *store.Channel, b: *store.Channel) bool {
+                const sa = x.st.isSelfDm(a);
+                const sb = x.st.isSelfDm(b);
+                if (sa != sb) return sa;
+                return byName(x, a, b);
+            }
             fn bySection(x: @This(), a: *store.Channel, b: *store.Channel) bool {
                 if (a.section_rank != b.section_rank) return a.section_rank < b.section_rank;
                 return byName(x, a, b);
@@ -860,7 +866,7 @@ pub const State = struct {
             }
         };
         const ctx: Ctx = .{ .st = st };
-        std.mem.sort(*store.Channel, starred.items, ctx, Ctx.byName);
+        std.mem.sort(*store.Channel, starred.items, ctx, Ctx.starredFirst);
         std.mem.sort(*store.Channel, above.items, ctx, Ctx.bySection);
         std.mem.sort(*store.Channel, chans.items, ctx, Ctx.byName);
         std.mem.sort(*store.Channel, dms.items, ctx, Ctx.byActivity);
