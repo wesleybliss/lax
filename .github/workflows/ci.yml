@@ -1,0 +1,22 @@
+# Every push and pull request: the tests, and a release build for Linux.
+name: ci
+
+on:
+    push:
+        branches: [master]
+    pull_request:
+
+permissions:
+    contents: read
+
+jobs:
+    test:
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+            - uses: mlugg/setup-zig@v2
+              with:
+                  version: 0.17.0
+            - run: sudo apt-get update && sudo apt-get install -y fonts-noto-core fonts-noto-color-emoji
+            - run: zig build test
+            - run: zig build -Dtarget=x86_64-linux-gnu.2.31 -Doptimize=ReleaseSafe

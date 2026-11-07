@@ -4,6 +4,10 @@ A minimal, native Slack desktop client. Zig + [nanoui](https://github.com/justra
 
 Personal use: one human, one install, no automation.
 
+## License
+
+[PolyForm Noncommercial 1.0.0](LICENSE): free to use, modify and share, including the source, for any noncommercial purpose. You may not sell it or anything built with it. Third-party code keeps its own licenses (`THIRD_PARTY_NOTICES.md`).
+
 ## Run
 
 ```sh

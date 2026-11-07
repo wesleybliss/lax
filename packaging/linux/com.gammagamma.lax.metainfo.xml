@@ -1,18 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-    <id>dev.lax.Lax</id>
+    <id>com.gammagamma.lax</id>
     <name>Lax</name>
     <summary>A minimal, native Slack desktop client</summary>
     <metadata_license>CC0-1.0</metadata_license>
-    <project_license>LicenseRef-proprietary</project_license>
-    <developer id="dev.lax">
-        <name>Lax</name>
+    <project_license>LicenseRef-PolyForm-Noncommercial-1.0.0</project_license>
+    <developer id="com.gammagamma">
+        <name>GAMMA GAMMA</name>
     </developer>
     <description>
         <p>Lax is a fast, native Slack client with no webview. It reuses the session the Slack desktop app already has, lists conversations the way Slack's sidebar does, and supports threads, reactions, drafts, saved items, light and dark mode and color themes.</p>
     </description>
     <url type="homepage">https://github.com/wesleybliss/lax</url>
-    <launchable type="desktop-id">dev.lax.Lax.desktop</launchable>
+    <launchable type="desktop-id">com.gammagamma.lax.desktop</launchable>
     <categories>
         <category>Network</category>
         <category>InstantMessaging</category>

@@ -32,8 +32,8 @@ mkdir -p "$OUT"
 
 # The metainfo with this release in it
 metainfo() {
-    local f="$OUT/dev.lax.Lax.metainfo.xml"
-    sed -e "s/@VERSION@/$VERSION/" -e "s/@DATE@/$(date -u +%F)/" packaging/linux/dev.lax.Lax.metainfo.xml >"$f"
+    local f="$OUT/com.gammagamma.lax.metainfo.xml"
+    sed -e "s/@VERSION@/$VERSION/" -e "s/@DATE@/$(date -u +%F)/" packaging/linux/com.gammagamma.lax.metainfo.xml >"$f"
     echo "$f"
 }
 
@@ -43,7 +43,7 @@ do_zip() {
     rm -rf "$stage" "$OUT/$NAME.zip"
     mkdir -p "$stage"
     install -m755 "$BIN" "$stage/lax"
-    cp README.md THIRD_PARTY_NOTICES.md "$stage/"
+    cp README.md LICENSE THIRD_PARTY_NOTICES.md "$stage/"
     (cd "$OUT" && zip -qr "$NAME.zip" "$NAME")
     rm -rf "$stage"
     echo "$OUT/$NAME.zip"
@@ -70,8 +70,8 @@ do_appimage() {
     mkdir -p "$dir/usr/bin" "$dir/usr/share/metainfo"
     install -m755 "$BIN" "$dir/usr/bin/lax"
     ln -s usr/bin/lax "$dir/AppRun"
-    cp packaging/linux/dev.lax.Lax.desktop "$dir/"
-    cp packaging/icon/lax-256.png "$dir/dev.lax.Lax.png"
+    cp packaging/linux/com.gammagamma.lax.desktop "$dir/"
+    cp packaging/icon/lax-256.png "$dir/com.gammagamma.lax.png"
     cp packaging/icon/lax-256.png "$dir/.DirIcon"
     cp "$(metainfo)" "$dir/usr/share/metainfo/"
     ARCH=$ARCH "$tool" --appimage-extract-and-run "$dir" "$OUT/$NAME.AppImage"
@@ -85,12 +85,12 @@ do_flatpak() {
     rm -rf "$src"
     mkdir -p "$src"
     install -m755 "$BIN" "$src/lax"
-    cp packaging/linux/dev.lax.Lax.yml packaging/linux/dev.lax.Lax.desktop "$src/"
+    cp packaging/linux/com.gammagamma.lax.yml packaging/linux/com.gammagamma.lax.desktop "$src/"
     cp "$(metainfo)" "$src/"
     cp packaging/icon/lax.svg packaging/icon/lax-256.png packaging/icon/lax-512.png "$src/"
     (cd "$src" && flatpak-builder --force-clean --user --install-deps-from=flathub \
-        --arch="$ARCH" --repo=repo --state-dir=.state build dev.lax.Lax.yml \
-        && flatpak build-bundle --arch="$ARCH" repo "../$NAME.flatpak" dev.lax.Lax)
+        --arch="$ARCH" --repo=repo --state-dir=.state build com.gammagamma.lax.yml \
+        && flatpak build-bundle --arch="$ARCH" repo "../$NAME.flatpak" com.gammagamma.lax)
     rm -rf "$src"
     echo "$OUT/$NAME.flatpak"
 }

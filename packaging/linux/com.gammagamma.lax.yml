@@ -1,6 +1,6 @@
 # Flatpak. `packaging/package.sh flatpak` stages the prebuilt binary in
 # dist/flatpak and builds with flatpak-builder (no network during the build).
-app-id: dev.lax.Lax
+app-id: com.gammagamma.lax
 runtime: org.gnome.Platform
 runtime-version: '50'
 sdk: org.gnome.Sdk
@@ -34,18 +34,18 @@ modules:
       buildsystem: simple
       build-commands:
           - install -Dm755 lax /app/bin/lax
-          - install -Dm644 dev.lax.Lax.desktop /app/share/applications/dev.lax.Lax.desktop
-          - install -Dm644 dev.lax.Lax.metainfo.xml /app/share/metainfo/dev.lax.Lax.metainfo.xml
-          - install -Dm644 lax.svg /app/share/icons/hicolor/scalable/apps/dev.lax.Lax.svg
-          - install -Dm644 lax-256.png /app/share/icons/hicolor/256x256/apps/dev.lax.Lax.png
-          - install -Dm644 lax-512.png /app/share/icons/hicolor/512x512/apps/dev.lax.Lax.png
+          - install -Dm644 com.gammagamma.lax.desktop /app/share/applications/com.gammagamma.lax.desktop
+          - install -Dm644 com.gammagamma.lax.metainfo.xml /app/share/metainfo/com.gammagamma.lax.metainfo.xml
+          - install -Dm644 lax.svg /app/share/icons/hicolor/scalable/apps/com.gammagamma.lax.svg
+          - install -Dm644 lax-256.png /app/share/icons/hicolor/256x256/apps/com.gammagamma.lax.png
+          - install -Dm644 lax-512.png /app/share/icons/hicolor/512x512/apps/com.gammagamma.lax.png
       sources:
           - type: file
             path: lax
           - type: file
-            path: dev.lax.Lax.desktop
+            path: com.gammagamma.lax.desktop
           - type: file
-            path: dev.lax.Lax.metainfo.xml
+            path: com.gammagamma.lax.metainfo.xml
           - type: file
             path: lax.svg
           - type: file

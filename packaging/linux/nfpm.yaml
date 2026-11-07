@@ -6,31 +6,33 @@ version: ${VERSION}
 version_schema: semver
 section: net
 priority: optional
-maintainer: Wesley Bliss <wesley.bliss@gmail.com>
+maintainer: GAMMA GAMMA <gammagammaco@gmail.com>
 description: |
     A minimal, native Slack desktop client.
     No webview: it reuses the session the Slack desktop app already has.
 homepage: https://github.com/wesleybliss/lax
-license: Proprietary
+license: PolyForm-Noncommercial-1.0.0
 contents:
     - src: ${BIN}
       dst: /usr/bin/lax
       expand: true
       file_info:
           mode: 0755
-    - src: packaging/linux/dev.lax.Lax.desktop
-      dst: /usr/share/applications/dev.lax.Lax.desktop
+    - src: LICENSE
+      dst: /usr/share/doc/lax/LICENSE
+    - src: packaging/linux/com.gammagamma.lax.desktop
+      dst: /usr/share/applications/com.gammagamma.lax.desktop
     - src: ${METAINFO}
-      dst: /usr/share/metainfo/dev.lax.Lax.metainfo.xml
+      dst: /usr/share/metainfo/com.gammagamma.lax.metainfo.xml
       expand: true
     - src: packaging/icon/lax.svg
-      dst: /usr/share/icons/hicolor/scalable/apps/dev.lax.Lax.svg
+      dst: /usr/share/icons/hicolor/scalable/apps/com.gammagamma.lax.svg
     - src: packaging/icon/lax-48.png
-      dst: /usr/share/icons/hicolor/48x48/apps/dev.lax.Lax.png
+      dst: /usr/share/icons/hicolor/48x48/apps/com.gammagamma.lax.png
     - src: packaging/icon/lax-256.png
-      dst: /usr/share/icons/hicolor/256x256/apps/dev.lax.Lax.png
+      dst: /usr/share/icons/hicolor/256x256/apps/com.gammagamma.lax.png
     - src: packaging/icon/lax-512.png
-      dst: /usr/share/icons/hicolor/512x512/apps/dev.lax.Lax.png
+      dst: /usr/share/icons/hicolor/512x512/apps/com.gammagamma.lax.png
 overrides:
     deb:
         depends:
