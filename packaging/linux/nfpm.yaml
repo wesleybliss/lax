@@ -25,8 +25,6 @@ contents:
     - src: ${METAINFO}
       dst: /usr/share/metainfo/com.gammagamma.lax.metainfo.xml
       expand: true
-    - src: packaging/icon/lax.svg
-      dst: /usr/share/icons/hicolor/scalable/apps/com.gammagamma.lax.svg
     - src: packaging/icon/lax-48.png
       dst: /usr/share/icons/hicolor/48x48/apps/com.gammagamma.lax.png
     - src: packaging/icon/lax-256.png

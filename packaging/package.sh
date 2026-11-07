@@ -87,7 +87,7 @@ do_flatpak() {
     install -m755 "$BIN" "$src/lax"
     cp packaging/linux/com.gammagamma.lax.yml packaging/linux/com.gammagamma.lax.desktop "$src/"
     cp "$(metainfo)" "$src/"
-    cp packaging/icon/lax.svg packaging/icon/lax-256.png packaging/icon/lax-512.png "$src/"
+    cp packaging/icon/lax-256.png packaging/icon/lax-512.png "$src/"
     (cd "$src" && flatpak-builder --force-clean --user --install-deps-from=flathub \
         --arch="$ARCH" --repo=repo --state-dir=.state build com.gammagamma.lax.yml \
         && flatpak build-bundle --arch="$ARCH" repo "../$NAME.flatpak" com.gammagamma.lax)

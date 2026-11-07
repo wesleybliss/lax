@@ -23,7 +23,7 @@ macOS signing and notarizing use these repo secrets, and are skipped (ad-hoc sig
 
 ## Layout
 
-- `icon/`: `lax.svg` is the source; the PNGs and `lax.ico` are rendered from it (`rsvg-convert`, `magick`).
+- `icon/`: `lax-1024.png` is the source (transparent background); the other PNGs and `lax.ico` are resized from it with `magick`.
 - `linux/`: desktop entry, AppStream metainfo, `nfpm.yaml`, Flatpak manifest. App id: `com.gammagamma.lax`. Licensed PolyForm Noncommercial 1.0.0 (`/LICENSE`), shipped in every package.
 - `macos/`: `Info.plist`, entitlements.
 - `windows/`: `lax.wxs`, `package.ps1`.
