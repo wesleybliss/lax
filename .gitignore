@@ -1,0 +1,43 @@
+# Zig
+.zig-cache/
+zig-cache/
+zig-out/
+zig-pkg/
+*.o
+*.obj
+
+# Secrets and credentials — never commit
+.env
+.env.*
+*.token
+*.cookie
+secrets/
+credentials*
+slack-profile-copy/
+tmp-profile/
+
+# Recorded traffic must be scrubbed before going into tests/fixtures
+captures/
+*.har
+*.pcap
+
+# Logs, dumps, profiling
+*.log
+core
+core.*
+vgcore.*
+callgrind.out.*
+massif.out.*
+perf.data*
+*.heaptrack*
+
+# Editors and OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Claude Code local state
+.claude/settings.local.json

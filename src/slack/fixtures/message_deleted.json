@@ -1,0 +1,1 @@
+{"type":"message","subtype":"message_deleted","previous_message":{"type":"message","user":"U000000001","text":"gone","ts":"1700000000.000100"},"channel":"C000000001","hidden":true,"deleted_ts":"1700000000.000100","ts":"1700000030.000500","event_ts":"1700000030.000500"}

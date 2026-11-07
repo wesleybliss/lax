@@ -1,0 +1,19 @@
+.{
+    .name = .lax_slack_clone,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .websocket = .{
+            .url = "git+https://github.com/karlseguin/websocket.zig#f2b3bad6875595e8dd42c726e8e914885a8b0ba0",
+            .hash = "websocket-0.1.0-ZPISdbERBQCnk2-UDVSJlOss6POs_aAJR2nrccYJ1wZm",
+        },
+        .nanoui = .{ .path = "third_party/nanoui" },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "third_party",
+    },
+    .fingerprint = 0x8893b16024991020,
+}
