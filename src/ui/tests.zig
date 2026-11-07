@@ -927,6 +927,37 @@ test "drafts page: drafts, scheduled and sent entries open their conversation" {
     try std.testing.expectEqualStrings("C1", state.selected.?);
 }
 
+test "saved page: lists saved messages, empty state, opens the conversation" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..3) |_| t.frame();
+    try t.clickText("Saved");
+    for (0..2) |_| t.frame();
+    try std.testing.expectEqual(store.FeedKind.saved, fake.feed_kind.?);
+    try st.apply(.{ .feed = .{ .kind = .saved, .entries = &.{} } });
+    for (0..2) |_| t.frame();
+    try std.testing.expect(t.hasText("Nothing saved"));
+    try st.apply(.{ .feed = .{ .kind = .saved, .entries = &.{
+        .{ .channel = "C1", .ts = "1700000000.000100", .user = "U2", .text = "remember this *one*" },
+        .{ .channel = "C1", .ts = "1700000050.000100" },
+    } } });
+    for (0..3) |_| t.frame();
+    try std.testing.expect(!t.hasText("Nothing saved"));
+    try std.testing.expect(t.hasText("Grace: remember this one"));
+    try std.testing.expect(t.hasText("Message not available"));
+    try t.clickText("Grace: remember this one");
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqualStrings("C1", state.selected.?);
+    try std.testing.expect(!t.hasText("Message not available"));
+}
+
 test "rail: hovering a workspace names it" {
     const gpa = std.testing.allocator;
     var st = store.Store.init(gpa);

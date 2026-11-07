@@ -957,7 +957,7 @@ pub const State = struct {
                 ui.textf(c, .{ .color = c.theme.muted, .size = 12 }, "{s} {d}, {d:0>2}:{d:0>2}", .{ monthName(tm.mon), @as(u32, @intCast(tm.mday)), @as(u32, @intCast(tm.hour)), @as(u32, @intCast(tm.min)) });
             }
         }
-        s.feedLine(c, e.user, e.text, c.theme.text);
+        if (e.text.len > 0) s.feedLine(c, e.user, e.text, c.theme.text) else ui.text(c, "Message not available", .{ .size = 14, .color = c.theme.muted });
         if (e.reply_text.len > 0) s.feedLine(c, e.reply_user, e.reply_text, c.theme.muted);
         if (e.note.len > 0) ui.text(c, e.note, .{ .size = 12, .weight = .semibold, .color = s.pal.link });
     }

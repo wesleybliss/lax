@@ -77,6 +77,8 @@ const full_refresh_ms = 5 * 60 * 1000;
 
 /// Conversations opened in the background after connecting, at most
 const prefetch_max = 10;
+/// Saved items listed on the page: each costs one request, for its message text
+const saved_max = 15;
 /// Gap between those fetches: a person clicking around
 const prefetch_gap_ms = 600;
 
@@ -961,7 +963,7 @@ pub const Net = struct {
         switch (kind) {
             .threads => try n.threadsFeed(api, tmp.allocator(), ia, &out),
             .drafts => try n.draftsFeed(api, tmp.allocator(), ia, &out),
-            .saved => return,
+            .saved => try n.savedFeed(api, tmp.allocator(), ia, &out),
         }
         n.emit(.{ .arena = item_arena, .update = .{ .feed = .{ .kind = kind, .entries = out.items } } });
     }
@@ -1021,6 +1023,32 @@ pub const Net = struct {
                     .note = label,
                 });
             }
+        }
+    }
+
+    /// Saved items still in progress, with each message's text
+    fn savedFeed(n: *Net, api: *slack.http.Api, tmp: std.mem.Allocator, ia: std.mem.Allocator, out: *std.ArrayList(store.FeedEntryInfo)) SessionError!void {
+        const res = api.call(tmp, "saved.list", &.{}) catch |err| return n.apiFailed(api, "saved.list", err);
+        for (json.arr(res.object, "saved_items")) |sv| {
+            if (sv != .object or out.items.len >= saved_max) continue;
+            const o = sv.object;
+            if (!std.mem.eql(u8, json.str(o, "item_type") orelse "", "message")) continue;
+            if (json.flag(o, "is_archived")) continue;
+            if (o.get("date_completed")) |v| if (v == .integer and v.integer > 0) continue;
+            const channel = json.str(o, "item_id") orelse continue;
+            const ts = json.str(o, "ts") orelse continue;
+            try n.checkpoint();
+            var user: []const u8 = "";
+            var text: []const u8 = "";
+            // The item names a message by channel and ts only
+            if (api.call(tmp, "conversations.history", &.{ .{ "channel", channel }, .{ "latest", ts }, .{ "inclusive", "true" }, .{ "limit", "1" } })) |hist| {
+                const msgs = json.arr(hist.object, "messages");
+                if (msgs.len > 0 and msgs[0] == .object and std.mem.eql(u8, json.str(msgs[0].object, "ts") orelse "", ts)) {
+                    user = try ia.dupe(u8, json.str(msgs[0].object, "user") orelse json.str(msgs[0].object, "bot_id") orelse "");
+                    text = try ia.dupe(u8, json.str(msgs[0].object, "text") orelse "");
+                }
+            } else |err| if (err == error.Aborted) return n.apiFailed(api, "conversations.history", err);
+            try out.append(ia, .{ .channel = try ia.dupe(u8, channel), .ts = try ia.dupe(u8, ts), .user = user, .text = text });
         }
     }
 
