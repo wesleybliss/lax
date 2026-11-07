@@ -34,6 +34,43 @@ pub const SectionPlace = enum {
     below,
 };
 
+/// The pages behind the sidebar's top rows that list messages
+pub const FeedKind = enum { threads, drafts, saved };
+
+/// One line of such a page, as the network side reports it
+pub const FeedEntryInfo = struct {
+    channel: []const u8,
+    ts: []const u8,
+    /// The thread it belongs to (empty when none)
+    thread_ts: []const u8 = "",
+    user: []const u8 = "",
+    text: []const u8 = "",
+    /// A short tag: "3 replies", "Draft", "Scheduled", "Sent"
+    note: []const u8 = "",
+    /// The newest reply, for a thread
+    reply_user: []const u8 = "",
+    reply_text: []const u8 = "",
+    unread: bool = false,
+};
+
+pub const FeedEntry = struct {
+    channel: []u8,
+    ts: []u8,
+    thread_ts: []u8,
+    user: []u8,
+    text: []u8,
+    note: []u8,
+    reply_user: []u8,
+    reply_text: []u8,
+    unread: bool,
+};
+
+pub const Feed = struct {
+    entries: std.ArrayList(FeedEntry) = .empty,
+    /// Slack has answered at least once
+    loaded: bool = false,
+};
+
 /// What the network side knows about a conversation
 pub const ChannelInfo = struct {
     id: []const u8,
@@ -132,6 +169,8 @@ pub const Update = union(enum) {
     marked: struct { channel: []const u8, ts: []const u8, unread: ?u32 = null, mentions: ?u32 = null },
     unreads: []const UnreadInfo,
     sidebar_mode: SidebarMode,
+    /// A top-row page's contents, newest first
+    feed: struct { kind: FeedKind, entries: []const FeedEntryInfo },
     /// The workspaces to switch between, and which one is shown
     teams: struct { list: []const TeamInfo, active: []const u8 },
     /// A workspace's icon (an encoded PNG)
@@ -252,9 +291,12 @@ const Space = struct {
     status: []u8,
     last_selected: []u8,
     sidebar_mode: SidebarMode,
+    feeds: [feed_kinds]Feed,
 
-    const empty: Space = .{ .self_id = &.{}, .team_name = &.{}, .users = .empty, .channels = .empty, .thread = null, .connection = .connecting, .status = &.{}, .last_selected = &.{}, .sidebar_mode = .active };
+    const empty: Space = .{ .self_id = &.{}, .team_name = &.{}, .users = .empty, .channels = .empty, .thread = null, .connection = .connecting, .status = &.{}, .last_selected = &.{}, .sidebar_mode = .active, .feeds = @splat(.{}) };
 };
+
+const feed_kinds = std.enums.values(FeedKind).len;
 
 pub const Store = struct {
     gpa: std.mem.Allocator,
@@ -274,6 +316,7 @@ pub const Store = struct {
     /// The conversation open last in this workspace, to return to
     last_selected: []u8 = &.{},
     sidebar_mode: SidebarMode = .active,
+    feeds: [feed_kinds]Feed = @splat(.{}),
     /// Filled from the disk cache; the first workspace list confirms or replaces it
     from_cache: bool = false,
     /// Other workspaces' data, by team id
@@ -311,7 +354,7 @@ pub const Store = struct {
     // The shown workspace's data moves in and out of `Space`s
 
     fn takeSpace(s: *Store) Space {
-        const sp: Space = .{ .self_id = s.self_id, .team_name = s.team_name, .users = s.users, .channels = s.channels, .thread = s.thread, .connection = s.connection, .status = s.status, .last_selected = s.last_selected, .sidebar_mode = s.sidebar_mode };
+        const sp: Space = .{ .self_id = s.self_id, .team_name = s.team_name, .users = s.users, .channels = s.channels, .thread = s.thread, .connection = s.connection, .status = s.status, .last_selected = s.last_selected, .sidebar_mode = s.sidebar_mode, .feeds = s.feeds };
         s.putSpace(.empty);
         return sp;
     }
@@ -326,6 +369,7 @@ pub const Store = struct {
         s.status = sp.status;
         s.last_selected = sp.last_selected;
         s.sidebar_mode = sp.sidebar_mode;
+        s.feeds = sp.feeds;
     }
 
     fn swapSpace(s: *Store, other: *Space) void {
@@ -348,6 +392,40 @@ pub const Store = struct {
         for (sp.channels.items) |*c| s.freeChannel(c);
         sp.channels.deinit(s.gpa);
         if (sp.thread) |*t| s.freeThread(t);
+        for (&sp.feeds) |*f| s.clearFeed(f);
+        for (&sp.feeds) |*f| f.entries.deinit(s.gpa);
+    }
+
+    fn clearFeed(s: *Store, f: *Feed) void {
+        for (f.entries.items) |e| {
+            inline for (.{ e.channel, e.ts, e.thread_ts, e.user, e.text, e.note, e.reply_user, e.reply_text }) |str| s.gpa.free(str);
+        }
+        f.entries.clearRetainingCapacity();
+    }
+
+    pub fn feed(s: *const Store, kind: FeedKind) *const Feed {
+        return &s.feeds[@intFromEnum(kind)];
+    }
+
+    fn setFeed(s: *Store, kind: FeedKind, infos: []const FeedEntryInfo) std.mem.Allocator.Error!void {
+        const f = &s.feeds[@intFromEnum(kind)];
+        s.clearFeed(f);
+        errdefer s.clearFeed(f);
+        try f.entries.ensureTotalCapacity(s.gpa, infos.len);
+        for (infos) |i| {
+            var e: FeedEntry = undefined;
+            var done: usize = 0;
+            errdefer inline for (.{ "channel", "ts", "thread_ts", "user", "text", "note", "reply_user", "reply_text" }, 0..) |name, k| {
+                if (k < done) s.gpa.free(@field(e, name));
+            };
+            inline for (.{ "channel", "ts", "thread_ts", "user", "text", "note", "reply_user", "reply_text" }) |name| {
+                @field(e, name) = try s.gpa.dupe(u8, @field(i, name));
+                done += 1;
+            }
+            e.unread = i.unread;
+            f.entries.appendAssumeCapacity(e);
+        }
+        f.loaded = true;
     }
 
     /// Shows another workspace: the current one is parked with everything it
@@ -593,6 +671,7 @@ pub const Store = struct {
                 }
             },
             .sidebar_mode => |m| s.sidebar_mode = m,
+            .feed => |f| try s.setFeed(f.kind, f.entries),
             .teams => |t| {
                 var fresh: std.ArrayList(Team) = .empty;
                 errdefer {

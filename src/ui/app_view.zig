@@ -58,7 +58,12 @@ pub const Actions = struct {
     manual: *const fn (ctx: *anyopaque, url: []const u8, token: []const u8, cookie: []const u8) void,
     /// Away (`true`) or automatic presence
     set_presence: *const fn (ctx: *anyopaque, away: bool) void,
+    /// Load (or refresh) one of the top-row pages
+    load_feed: *const fn (ctx: *anyopaque, kind: store.FeedKind) void,
 };
+
+/// A top-row page is fetched again when opened after this long
+const feed_refresh_ms: i64 = 30_000;
 
 const Tm = extern struct {
     sec: c_int,
@@ -78,6 +83,13 @@ extern "c" fn localtime_r(t: *const i64, out: *Tm) ?*Tm;
 fn tsSeconds(ts: []const u8) i64 {
     const dot = std.mem.indexOfScalar(u8, ts, '.') orelse ts.len;
     return std.fmt.parseInt(i64, ts[0..dot], 10) catch 0;
+}
+
+const feed_text_max = 240;
+
+fn monthName(mon: c_int) []const u8 {
+    const names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    return names[@intCast(std.math.clamp(mon, 0, 11))];
 }
 
 fn lineHeight(c: *ui.Context, style: ui.TextStyle) f32 {
@@ -101,6 +113,15 @@ const TopView = enum {
     huddles,
     drafts,
     saved,
+
+    fn feed(v: TopView) ?store.FeedKind {
+        return switch (v) {
+            .threads => .threads,
+            .drafts => .drafts,
+            .saved => .saved,
+            .none, .huddles => null,
+        };
+    }
 
     fn label(v: TopView) []const u8 {
         return switch (v) {
@@ -168,6 +189,9 @@ pub const State = struct {
     settings_open: bool = false,
     /// A page from the sidebar's top rows, in place of the conversation
     top_view: TopView = .none,
+    /// When each top-row page was last requested (0: not yet in this workspace)
+    feed_asked_ms: [3]i64 = @splat(0),
+    pending_thread: ?struct { channel: []const u8, ts: []const u8 } = null,
     /// The font pickers' popovers: interface, chat
     font_open: [2]bool = .{ false, false },
     /// Installed font families, found the first time Settings opens
@@ -358,10 +382,12 @@ pub const State = struct {
             s.threadPanel(c);
         }
 
+        defer s.pending_thread = null;
         if (s.pending_select) |id| {
             s.pending_select = null;
             s.top_view = .none;
             s.select(id);
+            if (s.pending_thread) |th| s.openThread(th.channel, th.ts);
         }
         if (s.close_thread) {
             s.close_thread = false;
@@ -373,6 +399,7 @@ pub const State = struct {
             // network side catches up and can be redirected at any time
             if (s.cache_dir) |dir| store.cache.save(s.gpa, s.io, dir, s.store);
             s.store.setActive(id) catch {};
+            s.feed_asked_ms = @splat(0);
             // A workspace not visited this run opens with its last known state
             if (s.store.channels.items.len == 0) if (s.cache_dir) |dir| {
                 var arena = std.heap.ArenaAllocator.init(s.gpa);
@@ -879,7 +906,7 @@ pub const State = struct {
         }
     }
 
-    /// The page behind a top row. None of them has its own view yet.
+    /// The page behind a top row
     fn topPage(s: *State, c: *ui.Context) void {
         const col = ui.div(c).column().grow().hFull().bg(c.theme.background);
         defer col.end();
@@ -889,7 +916,67 @@ pub const State = struct {
             ui.text(c, s.top_view.label(), .{ .weight = .semibold, .size = 18 });
         }
         ui.divider(c);
-        s.centered(c, "Coming soon");
+        const kind = s.top_view.feed() orelse return s.centered(c, "Coming soon");
+        const idx = @intFromEnum(kind);
+        const now = store.nowMs(s.io);
+        if (s.feed_asked_ms[idx] == 0 or now - s.feed_asked_ms[idx] > feed_refresh_ms) {
+            s.feed_asked_ms[idx] = now;
+            s.actions.load_feed(s.actions.ctx, kind);
+        }
+        const feed = s.store.feed(kind);
+        if (!feed.loaded) return s.loading(c);
+        if (feed.entries.items.len == 0) return s.centered(c, switch (kind) {
+            .threads => "No threads yet",
+            .drafts => "No drafts or sent messages",
+            .saved => "Nothing saved",
+        });
+        const list = ui.div(c).column().wFull().grow().scrollY().px(24).py(12).gap(8);
+        defer list.end();
+        for (feed.entries.items) |*e| s.feedCard(c, e);
+    }
+
+    fn feedCard(s: *State, c: *ui.Context, e: *const store.FeedEntry) void {
+        const ch = s.store.channel(e.channel);
+        const card = ui.div(c).column().wFull().gap(4).px(16).py(12).rounded(12).bg(s.pal.container).control().hover(c.theme.surface_hover);
+        defer card.end();
+        if (ch != null and card.clicked()) {
+            s.pending_select = ch.?.id;
+            if (e.thread_ts.len > 0) s.pending_thread = .{ .channel = ch.?.id, .ts = e.thread_ts };
+        }
+        {
+            const head = ui.div(c).row().itemsCenter().gap(8).wFull();
+            defer head.end();
+            const name = if (ch) |x| s.store.channelName(x) else "";
+            const prefix: []const u8 = if (ch) |x| (if (x.kind == .channel or x.kind == .private) "# " else "") else "";
+            ui.textf(c, .{ .weight = .semibold, .size = 14, .truncate = .ellipsis }, "{s}{s}", .{ prefix, if (name.len > 0) name else "Conversation" });
+            ui.spacer(c);
+            if (e.unread) ui.div(c).w(8).h(8).roundedFull().circular().bg(c.theme.accent).end();
+            var tm: Tm = undefined;
+            const secs = tsSeconds(e.ts);
+            if (localtime_r(&secs, &tm) != null) {
+                ui.textf(c, .{ .color = c.theme.muted, .size = 12 }, "{s} {d}, {d:0>2}:{d:0>2}", .{ monthName(tm.mon), @as(u32, @intCast(tm.mday)), @as(u32, @intCast(tm.hour)), @as(u32, @intCast(tm.min)) });
+            }
+        }
+        s.feedLine(c, e.user, e.text, c.theme.text);
+        if (e.reply_text.len > 0) s.feedLine(c, e.reply_user, e.reply_text, c.theme.muted);
+        if (e.note.len > 0) ui.text(c, e.note, .{ .size = 12, .weight = .semibold, .color = s.pal.link });
+    }
+
+    /// "Name: message" as plain text, cut short
+    fn feedLine(s: *State, c: *ui.Context, user: []const u8, text: []const u8, color: ui.Color) void {
+        const r = mrkdwn.render(c.alloc(), text, s.resolver()) catch mrkdwn.Rendered{ .text = text, .runs = &.{} };
+        var body: []u8 = c.alloc().dupe(u8, r.text) catch return;
+        for (body) |*ch| if (ch.* == '\n') {
+            ch.* = ' ';
+        };
+        if (body.len > feed_text_max) {
+            var cut: usize = feed_text_max;
+            while (cut > 0 and body[cut] & 0xC0 == 0x80) cut -= 1;
+            body = std.fmt.allocPrint(c.alloc(), "{s}…", .{body[0..cut]}) catch return;
+        }
+        if (user.len > 0) {
+            ui.textf(c, .{ .size = 14, .color = color, .wrap = true }, "{s}: {s}", .{ s.store.userName(user) orelse user, body });
+        } else ui.text(c, body, .{ .size = 14, .color = color, .wrap = true });
     }
 
     fn anyNamed(s: *State, list: []const *store.Channel) bool {

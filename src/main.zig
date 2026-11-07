@@ -98,6 +98,11 @@ fn actionPresence(ctx: *anyopaque, away: bool) void {
     net.setPresence(away);
 }
 
+fn actionFeed(ctx: *anyopaque, kind: store.FeedKind) void {
+    const net: *Net = @ptrCast(@alignCast(ctx));
+    net.loadFeed(kind);
+}
+
 fn actionManual(ctx: *anyopaque, url: []const u8, token: []const u8, cookie: []const u8) void {
     const net: *Net = @ptrCast(@alignCast(ctx));
     net.manualCredentials(url, token, cookie);
@@ -132,6 +137,7 @@ pub fn main(init: std.process.Init) !void {
         .switch_team = actionSwitchTeam,
         .manual = actionManual,
         .set_presence = actionPresence,
+        .load_feed = actionFeed,
     });
     defer state.deinit();
     state.preferred = channel;

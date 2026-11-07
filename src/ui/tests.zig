@@ -219,6 +219,8 @@ const Fake = struct {
     thread_calls: usize = 0,
     typing_calls: usize = 0,
     away: ?bool = null,
+    feed_calls: usize = 0,
+    feed_kind: ?store.FeedKind = null,
 
     fn actions(f: *Fake) app_view.Actions {
         return .{
@@ -233,7 +235,14 @@ const Fake = struct {
             .switch_team = switchTeam,
             .manual = manual,
             .set_presence = setPresence,
+            .load_feed = loadFeed,
         };
+    }
+
+    fn loadFeed(ctx: *anyopaque, kind: store.FeedKind) void {
+        const f: *Fake = @ptrCast(@alignCast(ctx));
+        f.feed_calls += 1;
+        f.feed_kind = kind;
     }
 
     fn setPresence(ctx: *anyopaque, away: bool) void {
@@ -839,12 +848,54 @@ test "sidebar: Slack's top rows, Starred, custom sections and Apps in order" {
     // The bot's DM is under Apps
     try std.testing.expect(t.findText("Helper Bot").?.y > t.findText("Apps").?.y);
     // A top row opens its page, a conversation closes it
-    try t.clickText("Saved");
+    try t.clickText("Huddles");
     for (0..2) |_| t.frame();
     try std.testing.expect(t.hasText("Coming soon"));
     try t.clickText("ops");
     for (0..2) |_| t.frame();
     try std.testing.expect(!t.hasText("Coming soon"));
+}
+
+test "threads page: loads on open, lists a thread, opens it" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..3) |_| t.frame();
+    try t.clickText("Threads");
+    for (0..3) |_| t.frame();
+    // Asked once, nothing shown until Slack answers
+    try std.testing.expectEqual(@as(usize, 1), fake.feed_calls);
+    try std.testing.expectEqual(store.FeedKind.threads, fake.feed_kind.?);
+    try std.testing.expect(!t.hasText("No threads yet"));
+    try st.apply(.{ .feed = .{ .kind = .threads, .entries = &.{.{
+        .channel = "C1",
+        .ts = "1700000000.000100",
+        .thread_ts = "1700000000.000100",
+        .user = "U2",
+        .text = "Can someone review this?",
+        .note = "2 replies",
+        .reply_user = "U1",
+        .reply_text = "On it",
+        .unread = true,
+    }} } });
+    for (0..3) |_| t.frame();
+    try std.testing.expect(t.hasText("2 replies"));
+    try std.testing.expect(t.hasText("Grace: Can someone review this?"));
+    try std.testing.expect(t.hasText("Alex: On it"));
+    try t.screenshot("/tmp/lax-threads.png");
+    try std.testing.expectEqual(@as(usize, 1), fake.feed_calls);
+    // Clicking the card opens the conversation and its thread
+    try t.clickText("Grace: Can someone review this?");
+    for (0..3) |_| t.frame();
+    try std.testing.expect(!t.hasText("2 replies"));
+    try std.testing.expect(st.thread != null);
+    try std.testing.expectEqualStrings("1700000000.000100", st.thread.?.ts);
 }
 
 test "rail: hovering a workspace names it" {

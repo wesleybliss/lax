@@ -26,6 +26,8 @@ pub const Command = union(enum) {
     switch_team: []u8,
     /// Away (true) or automatic presence
     presence: bool,
+    /// Load a top-row page (Threads, Drafts & sent, Saved)
+    feed: store.FeedKind,
     /// Credentials the user pasted
     manual: struct { url: []u8, token: []u8, cookie: []u8 },
     quit,
@@ -53,7 +55,7 @@ pub const Command = union(enum) {
             .typing => |ch| gpa.free(ch),
             .open => |ch| gpa.free(ch),
             .switch_team => |t| gpa.free(t),
-            .presence => {},
+            .presence, .feed => {},
             .mark => |m| {
                 gpa.free(m.channel);
                 gpa.free(m.ts);
@@ -218,6 +220,10 @@ pub const Net = struct {
         const t = n.gpa.dupe(u8, token) catch return;
         const c = n.gpa.dupe(u8, cookie) catch return;
         n.commands.push(n.gpa, n.io, .{ .manual = .{ .url = u, .token = t, .cookie = c } }) catch {};
+    }
+
+    pub fn loadFeed(n: *Net, kind: store.FeedKind) void {
+        n.commands.push(n.gpa, n.io, .{ .feed = kind }) catch {};
     }
 
     pub fn setPresence(n: *Net, away: bool) void {
@@ -945,6 +951,47 @@ pub const Net = struct {
         _ = api.call(tmp.allocator(), "conversations.mark", &.{ .{ "channel", channel }, .{ "ts", ts } }) catch {};
     }
 
+    fn fetchFeed(n: *Net, api: *slack.http.Api, kind: store.FeedKind) SessionError!void {
+        var item_arena = std.heap.ArenaAllocator.init(n.gpa);
+        errdefer item_arena.deinit();
+        const ia = item_arena.allocator();
+        var tmp = std.heap.ArenaAllocator.init(n.gpa);
+        defer tmp.deinit();
+        var out: std.ArrayList(store.FeedEntryInfo) = .empty;
+        switch (kind) {
+            .threads => try n.threadsFeed(api, tmp.allocator(), ia, &out),
+            .drafts, .saved => return,
+        }
+        n.emit(.{ .arena = item_arena, .update = .{ .feed = .{ .kind = kind, .entries = out.items } } });
+    }
+
+    /// The Threads page: threads you follow, newest activity first
+    fn threadsFeed(n: *Net, api: *slack.http.Api, tmp: std.mem.Allocator, ia: std.mem.Allocator, out: *std.ArrayList(store.FeedEntryInfo)) SessionError!void {
+        const res = api.call(tmp, "subscriptions.thread.getView", &.{.{ "limit", "30" }}) catch |err| return n.apiFailed(api, "subscriptions.thread.getView", err);
+        for (json.arr(res.object, "threads")) |tv| {
+            if (tv != .object) continue;
+            const root = json.obj(tv.object, "root_msg") orelse continue;
+            const channel = json.str(root, "channel") orelse continue;
+            const ts = json.str(root, "ts") orelse continue;
+            const replies = json.arr(tv.object, "latest_replies");
+            const newest: ?std.json.ObjectMap = if (replies.len > 0 and replies[replies.len - 1] == .object) replies[replies.len - 1].object else null;
+            const count: u32 = if (root.get("reply_count")) |c| (if (c == .integer) std.math.cast(u32, c.integer) orelse 0 else 0) else 0;
+            const last_read = json.str(root, "last_read") orelse "";
+            const latest = json.str(root, "latest_reply") orelse "";
+            try out.append(ia, .{
+                .channel = try ia.dupe(u8, channel),
+                .ts = try ia.dupe(u8, ts),
+                .thread_ts = try ia.dupe(u8, json.str(root, "thread_ts") orelse ts),
+                .user = try ia.dupe(u8, json.str(root, "user") orelse json.str(root, "bot_id") orelse ""),
+                .text = try ia.dupe(u8, json.str(root, "text") orelse ""),
+                .note = try std.fmt.allocPrint(ia, "{d} {s}", .{ count, if (count == 1) "reply" else "replies" }),
+                .reply_user = if (newest) |r| try ia.dupe(u8, json.str(r, "user") orelse json.str(r, "bot_id") orelse "") else "",
+                .reply_text = if (newest) |r| try ia.dupe(u8, json.str(r, "text") orelse "") else "",
+                .unread = latest.len > 0 and store.tsLess(last_read, latest),
+            });
+        }
+    }
+
     fn callPresence(n: *Net, api: *slack.http.Api, away: bool) void {
         var tmp = std.heap.ArenaAllocator.init(n.gpa);
         defer tmp.deinit();
@@ -1022,6 +1069,7 @@ pub const Net = struct {
                     .send => |m| try n.postMessage(api, m.channel, m.text, m.thread_ts),
                     .mark => |m| n.markRead(api, m.channel, m.ts),
                     .presence => |away| n.callPresence(api, away),
+                    .feed => |kind| n.fetchFeed(api, kind) catch |e| try soft(e),
                     .older => |m| n.fetchHistory(api, m.channel, m.before) catch |e| try soft(e),
                     .open_thread => |m| n.fetchReplies(api, m.channel, m.ts) catch |e| try soft(e),
                     .react => |m| try n.callReact(api, m.channel, m.ts, m.name, m.add),
