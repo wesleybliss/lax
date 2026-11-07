@@ -18,6 +18,20 @@ pub const Kind = enum { channel, private, im, mpim };
 pub const User = struct {
     id: []const u8,
     name: []const u8,
+    /// An app or bot: its DM goes under Apps
+    is_bot: bool = false,
+};
+
+/// Where Slack's channel sections put a conversation in the sidebar
+pub const SectionPlace = enum {
+    /// No section: it is listed by kind (Channels, Direct messages, Apps)
+    none,
+    /// The Starred section
+    starred,
+    /// A custom section above the Direct messages list
+    above,
+    /// A custom section below it
+    below,
 };
 
 /// What the network side knows about a conversation
@@ -29,6 +43,11 @@ pub const ChannelInfo = struct {
     user_id: ?[]const u8 = null,
     /// Slack marks it dormant: no recent activity (`properties.is_dormant`)
     dormant: bool = false,
+    /// The channel section holding it (a custom one's name), by `place`
+    section: []const u8 = "",
+    place: SectionPlace = .none,
+    /// Position among the custom sections
+    section_rank: u16 = 0,
 };
 
 /// Slack's `sidebar_behavior` preference: which conversations the sidebar lists
@@ -207,13 +226,17 @@ pub const Channel = struct {
     /// Others stay out of the sidebar unless they get a message.
     listed: bool = true,
     dormant: bool = false,
+    /// The channel section holding it (a custom one's name), by `place`
+    section: []u8 = &.{},
+    place: SectionPlace = .none,
+    section_rank: u16 = 0,
     /// Loaded from the disk cache and not yet confirmed by Slack
     stale: bool = false,
 };
 
 pub const max_messages_per_channel = 1000;
 
-const StoredUser = struct { id: []u8, name: []u8, online: bool = false };
+const StoredUser = struct { id: []u8, name: []u8, online: bool = false, is_bot: bool = false };
 
 pub const Team = struct { id: []u8, name: []u8, url: []u8, icon: []u8 = &.{} };
 
@@ -406,6 +429,7 @@ pub const Store = struct {
         if (c.user_id) |u| s.gpa.free(u);
         s.gpa.free(c.latest);
         s.gpa.free(c.activity);
+        s.gpa.free(c.section);
     }
 
     fn replace(s: *Store, slot: *[]u8, value: []const u8) std.mem.Allocator.Error!void {
@@ -427,6 +451,13 @@ pub const Store = struct {
     pub fn channelName(s: *const Store, c: *const Channel) []const u8 {
         if (c.user_id) |uid| if (s.userName(uid)) |n| return n;
         return c.name;
+    }
+
+    /// A DM with an app or bot (listed under Apps)
+    pub fn isApp(s: *const Store, c: *const Channel) bool {
+        if (c.kind != .im) return false;
+        const uid = c.user_id orelse return false;
+        return if (s.users.get(uid)) |u| u.is_bot else false;
     }
 
     pub fn isOnline(s: *const Store, user_id: []const u8) bool {
@@ -729,18 +760,22 @@ pub const Store = struct {
     fn upsertUser(s: *Store, user: User) std.mem.Allocator.Error!void {
         if (s.users.getPtr(user.id)) |existing| {
             try s.replace(&existing.name, user.name);
+            existing.is_bot = user.is_bot;
             return;
         }
         const id = try s.gpa.dupe(u8, user.id);
         errdefer s.gpa.free(id);
         const name = try s.gpa.dupe(u8, user.name);
         errdefer s.gpa.free(name);
-        try s.users.put(s.gpa, id, .{ .id = id, .name = name });
+        try s.users.put(s.gpa, id, .{ .id = id, .name = name, .is_bot = user.is_bot });
     }
 
     fn upsertChannel(s: *Store, info: ChannelInfo) std.mem.Allocator.Error!void {
         if (s.channel(info.id)) |c| {
             try s.replace(&c.name, info.name);
+            try s.replace(&c.section, info.section);
+            c.place = info.place;
+            c.section_rank = info.section_rank;
             c.dormant = info.dormant;
             c.stale = false;
             return;
@@ -753,6 +788,9 @@ pub const Store = struct {
             .latest = &.{},
             .activity = &.{},
             .dormant = info.dormant,
+            .section = &.{},
+            .place = info.place,
+            .section_rank = info.section_rank,
         };
         errdefer s.gpa.free(c.id);
         c.name = try s.gpa.dupe(u8, info.name);
@@ -761,6 +799,8 @@ pub const Store = struct {
         errdefer if (c.user_id) |uid| s.gpa.free(uid);
         c.activity = try s.gpa.dupe(u8, "");
         errdefer s.gpa.free(c.activity);
+        c.section = try s.gpa.dupe(u8, info.section);
+        errdefer s.gpa.free(c.section);
         try s.channels.append(s.gpa, c);
     }
 

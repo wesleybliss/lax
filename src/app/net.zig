@@ -700,6 +700,74 @@ pub const Net = struct {
         }
     }
 
+    /// Where one conversation sits in Slack's channel sections
+    const Placement = struct { section: []const u8, place: store.SectionPlace, rank: u16 };
+
+    /// The user's channel sections (Starred and custom ones), by conversation
+    /// id, the way the web client reads them. Best effort: without them
+    /// conversations are listed by kind.
+    fn fetchSections(n: *Net, api: *slack.http.Api, arena: std.mem.Allocator) SessionError!std.StringHashMapUnmanaged(Placement) {
+        var map: std.StringHashMapUnmanaged(Placement) = .empty;
+        var tmp = std.heap.ArenaAllocator.init(n.gpa);
+        defer tmp.deinit();
+        const res = api.call(tmp.allocator(), "users.channelSections.list", &.{}) catch |err| {
+            if (err == error.SlackError and api.diag.isAuthError()) return error.AuthFailed;
+            if (err == error.Aborted) return n.apiFailed(api, "users.channelSections.list", err);
+            n.dbg("users.channelSections.list failed: {s}", .{@errorName(err)});
+            return map;
+        };
+        const sections = json.arr(res.object, "channel_sections");
+        const order = sectionOrder(tmp.allocator(), sections) catch return map;
+        // Custom sections count from 0; a section after Direct messages is "below"
+        var rank: u16 = 0;
+        var after_dms = false;
+        for (order) |sv| {
+            const o = sv.object;
+            const kind = json.str(o, "type") orelse "";
+            if (std.mem.eql(u8, kind, "direct_messages")) after_dms = true;
+            const place: store.SectionPlace = if (std.mem.eql(u8, kind, "stars")) .starred else if (std.mem.eql(u8, kind, "standard")) (if (after_dms) .below else .above) else continue;
+            const name = try arena.dupe(u8, json.str(o, "name") orelse "");
+            const ids = if (json.obj(o, "channel_ids_page")) |page| json.arr(page, "channel_ids") else &.{};
+            for (ids) |idv| {
+                if (idv != .string) continue;
+                try map.put(arena, try arena.dupe(u8, idv.string), .{ .section = name, .place = place, .rank = rank });
+            }
+            if (place != .starred) rank += 1;
+        }
+        try n.fetchStars(api, arena, &map);
+        n.dbg("channel sections: {d}, placing {d} conversations", .{ order.len, map.count() });
+        return map;
+    }
+
+    /// Starred conversations: Slack's own sidebar fills Starred from
+    /// `stars.list`, the section itself comes back empty
+    fn fetchStars(n: *Net, api: *slack.http.Api, arena: std.mem.Allocator, map: *std.StringHashMapUnmanaged(Placement)) SessionError!void {
+        var page: u32 = 1;
+        while (page <= 5) : (page += 1) {
+            try n.checkpoint();
+            var tmp = std.heap.ArenaAllocator.init(n.gpa);
+            defer tmp.deinit();
+            var buf: [16]u8 = undefined;
+            const page_str = std.fmt.bufPrint(&buf, "{d}", .{page}) catch return;
+            const res = api.call(tmp.allocator(), "stars.list", &.{ .{ "page", page_str }, .{ "count", "100" } }) catch |err| {
+                if (err == error.SlackError and api.diag.isAuthError()) return error.AuthFailed;
+                if (err == error.Aborted) return n.apiFailed(api, "stars.list", err);
+                n.dbg("stars.list failed: {s}", .{@errorName(err)});
+                return;
+            };
+            for (json.arr(res.object, "items")) |iv| {
+                if (iv != .object) continue;
+                const kind = json.str(iv.object, "type") orelse continue;
+                // Starred messages and files are Saved items, not sidebar entries
+                if (!std.mem.eql(u8, kind, "channel") and !std.mem.eql(u8, kind, "group") and !std.mem.eql(u8, kind, "im")) continue;
+                const id = json.str(iv.object, "channel") orelse continue;
+                try map.put(arena, try arena.dupe(u8, id), .{ .section = "", .place = .starred, .rank = 0 });
+            }
+            const pages = if (json.obj(res.object, "paging")) |p| (if (p.get("pages")) |v| (if (v == .integer) v.integer else 1) else 1) else 1;
+            if (page >= pages) return;
+        }
+    }
+
     fn fetchConversations(n: *Net, api: *slack.http.Api) SessionError!void {
         const cache = n.cur.?;
         cache.clearDmUsers(n.gpa);
@@ -707,6 +775,8 @@ pub const Net = struct {
         errdefer item_arena.deinit();
         const ia = item_arena.allocator();
         var out: std.ArrayList(store.ChannelInfo) = .empty;
+        try n.checkpoint();
+        const placed = try n.fetchSections(api, ia);
 
         var page_arena_state = std.heap.ArenaAllocator.init(n.gpa);
         defer page_arena_state.deinit();
@@ -736,6 +806,9 @@ pub const Net = struct {
                     .kind = kind,
                     .user_id = if (json.str(o, "user")) |u| try ia.dupe(u8, u) else null,
                     .dormant = if (json.obj(o, "properties")) |p| json.flag(p, "is_dormant") else false,
+                    .section = if (placed.get(id)) |pl| pl.section else "",
+                    .place = if (placed.get(id)) |pl| pl.place else .none,
+                    .section_rank = if (placed.get(id)) |pl| pl.rank else 0,
                 });
             }
             const next = json.nextCursor(res) orelse break;
@@ -1115,13 +1188,47 @@ pub const Net = struct {
 };
 
 /// A user object to the name we show: display name, else real name, else handle
+/// The sections in sidebar order: Slack links each to the next one
+fn sectionOrder(arena: std.mem.Allocator, sections: []const std.json.Value) std.mem.Allocator.Error![]const std.json.Value {
+    var out: std.ArrayList(std.json.Value) = .empty;
+    var by_id: std.StringHashMapUnmanaged(std.json.Value) = .empty;
+    var pointed_at: std.StringHashMapUnmanaged(void) = .empty;
+    for (sections) |sv| {
+        if (sv != .object) continue;
+        const id = json.str(sv.object, "channel_section_id") orelse continue;
+        try by_id.put(arena, id, sv);
+        if (json.str(sv.object, "next_channel_section_id")) |next| if (next.len > 0) try pointed_at.put(arena, next, {});
+    }
+    var visited: std.StringHashMapUnmanaged(void) = .empty;
+    // The head is the one nothing points at; a broken chain keeps what is left in list order
+    for (sections) |head| {
+        if (head != .object) continue;
+        const hid = json.str(head.object, "channel_section_id") orelse continue;
+        if (pointed_at.contains(hid) or visited.contains(hid)) continue;
+        var cur = head;
+        while (true) {
+            const id = json.str(cur.object, "channel_section_id") orelse break;
+            if ((try visited.fetchPut(arena, id, {})) != null) break;
+            try out.append(arena, cur);
+            const next = json.str(cur.object, "next_channel_section_id") orelse break;
+            cur = by_id.get(next) orelse break;
+        }
+    }
+    for (sections) |sv| {
+        if (sv != .object) continue;
+        const id = json.str(sv.object, "channel_section_id") orelse continue;
+        if (!visited.contains(id)) try out.append(arena, sv);
+    }
+    return out.items;
+}
+
 fn userOf(arena: std.mem.Allocator, o: std.json.ObjectMap) std.mem.Allocator.Error!?store.User {
     const id = json.str(o, "id") orelse return null;
     const profile = json.obj(o, "profile");
     const display = if (profile) |p| json.str(p, "display_name") orelse "" else "";
     const real = if (profile) |p| json.str(p, "real_name") orelse "" else "";
     const name = if (display.len > 0) display else if (real.len > 0) real else json.str(o, "name") orelse id;
-    return .{ .id = try arena.dupe(u8, id), .name = try arena.dupe(u8, name) };
+    return .{ .id = try arena.dupe(u8, id), .name = try arena.dupe(u8, name), .is_bot = json.flag(o, "is_bot") or json.flag(o, "is_app_user") };
 }
 
 fn normalizeUrl(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error![]u8 {
@@ -1131,6 +1238,22 @@ fn normalizeUrl(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Err
     const host = t[0..host_end];
     if (host.len == 0) return gpa.dupe(u8, "");
     return std.fmt.allocPrint(gpa, "https://{s}", .{host});
+}
+
+test "sectionOrder follows the next links" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const doc = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\[{"channel_section_id":"B","type":"channels","next_channel_section_id":"C"},
+        \\ {"channel_section_id":"C","type":"direct_messages","next_channel_section_id":""},
+        \\ {"channel_section_id":"A","type":"stars","next_channel_section_id":"B"},
+        \\ {"channel_section_id":"X","type":"agents","next_channel_section_id":"nowhere"}]
+    , .{});
+    const order = try sectionOrder(a, doc.array.items);
+    try std.testing.expectEqual(@as(usize, 4), order.len);
+    const want = [_][]const u8{ "A", "B", "C", "X" };
+    for (order, want) |sv, id| try std.testing.expectEqualStrings(id, json.str(sv.object, "channel_section_id").?);
 }
 
 test "normalizeUrl" {

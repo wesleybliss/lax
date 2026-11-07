@@ -68,6 +68,21 @@ pub fn main(init: std.process.Init) !void {
                 const o = sec.object;
                 const ids = if (o.get("channel_ids_page")) |p| (if (p.object.get("channel_ids")) |a| a.array.items.len else 0) else 0;
                 try w.print("  section type={s} name={s} ids={d}\n", .{ if (o.get("type")) |t| t.string else "?", if (o.get("name")) |t| t.string else "?", ids });
+                if (o.get("channel_ids_page")) |p| {
+                    var pit = p.object.iterator();
+                    while (pit.next()) |kv| switch (kv.value_ptr.*) {
+                        .array => |a| try w.print("    page.{s}: array[{d}]\n", .{ kv.key_ptr.*, a.items.len }),
+                        .integer => |n| try w.print("    page.{s}: {d}\n", .{ kv.key_ptr.*, n }),
+                        .bool => |b| try w.print("    page.{s}: {}\n", .{ kv.key_ptr.*, b }),
+                        .string => |s| try w.print("    page.{s}: string({d})\n", .{ kv.key_ptr.*, s.len }),
+                        else => try w.print("    page.{s}: other\n", .{kv.key_ptr.*}),
+                    };
+                }
+            };
+            if (std.mem.eql(u8, method, "stars.list")) if (raw.object.get("items")) |items| for (items.array.items) |it| {
+                const kind = if (it.object.get("type")) |v| v.string else "?";
+                const ch = if (it.object.get("channel")) |v| v.string else "";
+                try w.print("  star type={s} channel-id-prefix={s}\n", .{ kind, if (ch.len > 0) ch[0..1] else "-" });
             };
             // SPIKE_PICK="a.b.c" prints one string/bool/int field by dotted path (non-secret fields only)
             if (init.environ_map.get("SPIKE_PICK")) |path| {

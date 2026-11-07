@@ -94,6 +94,35 @@ fn initialOf(c: *ui.Context, name: []const u8) []const u8 {
     return out;
 }
 
+/// The sidebar's top rows; each opens a page of its own
+const TopView = enum {
+    none,
+    threads,
+    huddles,
+    drafts,
+    saved,
+
+    fn label(v: TopView) []const u8 {
+        return switch (v) {
+            .none => "",
+            .threads => "Threads",
+            .huddles => "Huddles",
+            .drafts => "Drafts & sent",
+            .saved => "Saved",
+        };
+    }
+
+    fn glyph(v: TopView) []const u8 {
+        return switch (v) {
+            .none => "",
+            .threads => "💬",
+            .huddles => "🎧",
+            .drafts => "📝",
+            .saved => "🔖",
+        };
+    }
+};
+
 const LinkSpan = struct { start: u32, end: u32, target: []const u8 };
 
 pub const State = struct {
@@ -130,12 +159,15 @@ pub const State = struct {
     /// Show the DMs / channels the sidebar preference hides
     show_hidden_dms: bool = false,
     show_hidden_chans: bool = false,
+    show_hidden_apps: bool = false,
     /// The message box is tall (10 lines) instead of 2
     composer_expanded: bool = false,
     settings: settings_mod.Settings = .{},
     /// Owns the strings of `settings`
     settings_arena: std.heap.ArenaAllocator,
     settings_open: bool = false,
+    /// A page from the sidebar's top rows, in place of the conversation
+    top_view: TopView = .none,
     /// The font pickers' popovers: interface, chat
     font_open: [2]bool = .{ false, false },
     /// Installed font families, found the first time Settings opens
@@ -318,14 +350,17 @@ pub const State = struct {
         s.resizeHandle(c);
         if (s.settings_open) {
             s.settingsPage(c);
+        } else if (s.top_view != .none) {
+            s.topPage(c);
         } else s.main(c);
-        if (!s.settings_open and s.store.thread != null) {
+        if (!s.settings_open and s.top_view == .none and s.store.thread != null) {
             ui.div(c).w(1).hFull().bg(c.theme.border).end();
             s.threadPanel(c);
         }
 
         if (s.pending_select) |id| {
             s.pending_select = null;
+            s.top_view = .none;
             s.select(id);
         }
         if (s.close_thread) {
@@ -762,16 +797,33 @@ pub const State = struct {
         const scroller = ui.div(c).column().wFull().grow().scrollY().px(12).pb(12);
         defer scroller.end();
 
+        s.topRows(c);
+
         const st = s.store;
-        var chans: std.ArrayList(*store.Channel) = .empty;
-        var dms: std.ArrayList(*store.Channel) = .empty;
+        var lists: [6]std.ArrayList(*store.Channel) = @splat(.empty);
+        const starred = &lists[0];
+        const above = &lists[1];
+        const chans = &lists[2];
+        const dms = &lists[3];
+        const below = &lists[4];
+        const apps = &lists[5];
         for (st.channels.items) |*ch| {
-            (if (ch.kind == .channel or ch.kind == .private) &chans else &dms).append(c.alloc(), ch) catch {};
+            const list = switch (ch.place) {
+                .starred => starred,
+                .above => above,
+                .below => below,
+                .none => if (ch.kind == .channel or ch.kind == .private) chans else if (st.isApp(ch)) apps else dms,
+            };
+            list.append(c.alloc(), ch) catch {};
         }
         const Ctx = struct {
             st: *store.Store,
             fn byName(x: @This(), a: *store.Channel, b: *store.Channel) bool {
                 return std.ascii.lessThanIgnoreCase(x.st.channelName(a), x.st.channelName(b));
+            }
+            fn bySection(x: @This(), a: *store.Channel, b: *store.Channel) bool {
+                if (a.section_rank != b.section_rank) return a.section_rank < b.section_rank;
+                return byName(x, a, b);
             }
             fn byActivity(x: @This(), a: *store.Channel, b: *store.Channel) bool {
                 const ta = if (a.activity.len > 0) a.activity else a.latest;
@@ -780,16 +832,84 @@ pub const State = struct {
                 return byName(x, a, b);
             }
         };
-        std.mem.sort(*store.Channel, chans.items, Ctx{ .st = st }, Ctx.byName);
-        std.mem.sort(*store.Channel, dms.items, Ctx{ .st = st }, Ctx.byActivity);
+        const ctx: Ctx = .{ .st = st };
+        std.mem.sort(*store.Channel, starred.items, ctx, Ctx.byName);
+        std.mem.sort(*store.Channel, above.items, ctx, Ctx.bySection);
+        std.mem.sort(*store.Channel, chans.items, ctx, Ctx.byName);
+        std.mem.sort(*store.Channel, dms.items, ctx, Ctx.byActivity);
+        std.mem.sort(*store.Channel, below.items, ctx, Ctx.bySection);
+        std.mem.sort(*store.Channel, apps.items, ctx, Ctx.byActivity);
 
-        // Direct messages first, like Slack's own sidebar
-        s.sectionHeader(c, "Direct messages");
-        const hidden_dms = s.sectionRows(c, dms.items, s.show_hidden_dms);
-        if (hidden_dms > 0 or s.show_hidden_dms) s.hiddenToggle(c, &s.show_hidden_dms, hidden_dms);
+        // Slack's order: Starred, the user's own sections, Channels, Direct messages, Apps
+        if (s.anyNamed(starred.items)) {
+            s.sectionHeader(c, "Starred");
+            _ = s.sectionRows(c, starred.items, true);
+        }
+        s.customSections(c, above.items);
         s.sectionHeader(c, "Channels");
         const hidden_chans = s.sectionRows(c, chans.items, s.show_hidden_chans);
         if (hidden_chans > 0 or s.show_hidden_chans) s.hiddenToggle(c, &s.show_hidden_chans, hidden_chans);
+        s.sectionHeader(c, "Direct messages");
+        const hidden_dms = s.sectionRows(c, dms.items, s.show_hidden_dms);
+        if (hidden_dms > 0 or s.show_hidden_dms) s.hiddenToggle(c, &s.show_hidden_dms, hidden_dms);
+        s.customSections(c, below.items);
+        if (s.anyNamed(apps.items)) {
+            s.sectionHeader(c, "Apps");
+            const hidden_apps = s.sectionRows(c, apps.items, s.show_hidden_apps);
+            if (hidden_apps > 0 or s.show_hidden_apps) s.hiddenToggle(c, &s.show_hidden_apps, hidden_apps);
+        }
+    }
+
+    /// Threads, Huddles, Drafts & sent and Saved
+    fn topRows(s: *State, c: *ui.Context) void {
+        inline for (.{ TopView.threads, TopView.huddles, TopView.drafts, TopView.saved }) |v| {
+            const active = s.top_view == v;
+            var row = ui.div(c).row().itemsCenter().gap(12).wFull().h(nav_h).px(16).control().roundedFull().circular();
+            if (active) row = row.bg(s.pal.secondary_container);
+            row = row.hover(if (active) s.pal.secondary_container else c.theme.surface_hover);
+            defer row.end();
+            if (row.clicked()) {
+                s.top_view = v;
+                s.settings_open = false;
+            }
+            const icon = ui.div(c).w(20).h(nav_h).center();
+            ui.text(c, v.glyph(), .{ .size = 15 });
+            icon.end();
+            ui.text(c, v.label(), .{ .size = 15, .weight = if (active) .semibold else .regular, .color = if (active) c.theme.text else c.theme.muted });
+        }
+    }
+
+    /// The page behind a top row. None of them has its own view yet.
+    fn topPage(s: *State, c: *ui.Context) void {
+        const col = ui.div(c).column().grow().hFull().bg(c.theme.background);
+        defer col.end();
+        {
+            const bar = ui.div(c).row().itemsCenter().wFull().h(64).px(24);
+            defer bar.end();
+            ui.text(c, s.top_view.label(), .{ .weight = .semibold, .size = 18 });
+        }
+        ui.divider(c);
+        s.centered(c, "Coming soon");
+    }
+
+    fn anyNamed(s: *State, list: []const *store.Channel) bool {
+        for (list) |ch| if (s.store.channelName(ch).len > 0) return true;
+        return false;
+    }
+
+    /// The user's own sections: `list` is sorted by section, one header each
+    fn customSections(s: *State, c: *ui.Context, list: []const *store.Channel) void {
+        var from: usize = 0;
+        while (from < list.len) {
+            var to = from + 1;
+            while (to < list.len and list[to].section_rank == list[from].section_rank) to += 1;
+            const group = list[from..to];
+            if (s.anyNamed(group)) {
+                s.sectionHeader(c, if (group[0].section.len > 0) group[0].section else "Section");
+                _ = s.sectionRows(c, group, true);
+            }
+            from = to;
+        }
     }
 
     /// Rows a section lists under the sidebar preference; returns how many it hid
@@ -849,7 +969,7 @@ pub const State = struct {
     }
 
     fn channelRow(s: *State, c: *ui.Context, ch: *store.Channel) void {
-        const is_sel = if (s.selected) |id| std.mem.eql(u8, id, ch.id) else false;
+        const is_sel = s.top_view == .none and (if (s.selected) |id| std.mem.eql(u8, id, ch.id) else false);
         var row = ui.div(c).row().itemsCenter().gap(12).wFull().h(nav_h).px(16).control().roundedFull().circular();
         if (is_sel) row = row.bg(s.pal.secondary_container);
         row = row.hover(if (is_sel) s.pal.secondary_container else c.theme.surface_hover);

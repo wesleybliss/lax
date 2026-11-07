@@ -772,7 +772,7 @@ test "toolbar floats whole over a short continuation row with reactions" {
     try std.testing.expectEqual(@as(usize, 1), fake.thread_calls);
 }
 
-test "sidebar: direct messages above channels, closed DMs hidden, strip resizes" {
+test "sidebar: channels above direct messages, closed DMs hidden, strip resizes" {
     const gpa = std.testing.allocator;
     var st = store.Store.init(gpa);
     defer st.deinit();
@@ -792,7 +792,7 @@ test "sidebar: direct messages above channels, closed DMs hidden, strip resizes"
     for (0..4) |_| t.frame();
     const dm = t.findText("Direct messages").?;
     const ch = t.findText("Channels").?;
-    try std.testing.expect(dm.y < ch.y);
+    try std.testing.expect(ch.y < dm.y);
     try std.testing.expect(!t.hasText("Hidden Hank"));
     // The dragged strip sits right of the sidebar
     const before = state.sidebar_px;
@@ -804,6 +804,47 @@ test "sidebar: direct messages above channels, closed DMs hidden, strip resizes"
     try st.apply(.{ .message = .{ .channel = "D2", .message = .{ .ts = "1700000300.000100", .user = "U3", .text = "hi" } } });
     t.frame();
     try std.testing.expect(t.hasText("Hidden Hank"));
+}
+
+test "sidebar: Slack's top rows, Starred, custom sections and Apps in order" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    try st.apply(.{ .users = &.{.{ .id = "UB", .name = "Helper Bot", .is_bot = true }} });
+    try st.apply(.{ .channels = &.{
+        .{ .id = "C1", .name = "general", .kind = .channel, .section = "", .place = .starred },
+        .{ .id = "C7", .name = "ops", .kind = .channel, .section = "Work", .place = .above },
+        .{ .id = "D1", .name = "", .kind = .im, .user_id = "U2", .section = "Later", .place = .below },
+        .{ .id = "D9", .name = "", .kind = .im, .user_id = "UB" },
+    } });
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 900, .scale = 1 });
+    defer t.deinit();
+    for (0..4) |_| t.frame();
+    const order = [_][]const u8{ "Threads", "Huddles", "Drafts & sent", "Saved", "Starred", "Work", "Channels", "Direct messages", "Later", "Apps" };
+    var prev: f32 = -1;
+    for (order) |label| {
+        const r = t.findText(label) orelse {
+            std.debug.print("missing: {s}\n", .{label});
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(r.y > prev);
+        prev = r.y;
+    }
+    // A starred channel is listed there and not again under Channels
+    try std.testing.expect(t.findText("general").?.y < t.findText("Work").?.y);
+    // The bot's DM is under Apps
+    try std.testing.expect(t.findText("Helper Bot").?.y > t.findText("Apps").?.y);
+    // A top row opens its page, a conversation closes it
+    try t.clickText("Saved");
+    for (0..2) |_| t.frame();
+    try std.testing.expect(t.hasText("Coming soon"));
+    try t.clickText("ops");
+    for (0..2) |_| t.frame();
+    try std.testing.expect(!t.hasText("Coming soon"));
 }
 
 test "rail: hovering a workspace names it" {

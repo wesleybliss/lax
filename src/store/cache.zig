@@ -28,6 +28,9 @@ const FChannel = struct {
     kind: root.Kind,
     user_id: ?[]const u8 = null,
     dormant: bool = false,
+    section: []const u8 = "",
+    place: root.SectionPlace = .none,
+    section_rank: u16 = 0,
     listed: bool = true,
     activity: []const u8 = "",
     messages: []const FMessage = &.{},
@@ -97,7 +100,7 @@ pub fn save(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, st: *const Stor
     // The shown workspace
     var users: std.ArrayList(root.User) = .empty;
     var it = st.users.valueIterator();
-    while (it.next()) |u| users.append(a, .{ .id = u.id, .name = u.name }) catch return;
+    while (it.next()) |u| users.append(a, .{ .id = u.id, .name = u.name, .is_bot = u.is_bot }) catch return;
     var channels = a.alloc(FChannel, st.channels.items.len) catch return;
     for (st.channels.items, 0..) |c, i| {
         const from = c.messages.items.len -| keep_messages;
@@ -114,6 +117,9 @@ pub fn save(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, st: *const Stor
             .kind = c.kind,
             .user_id = c.user_id,
             .dormant = c.dormant,
+            .section = c.section,
+            .place = c.place,
+            .section_rank = c.section_rank,
             .listed = c.listed,
             .activity = if (c.activity.len > 0) c.activity else c.latest,
             .messages = msgs,
@@ -176,7 +182,7 @@ fn applyTeam(a: std.mem.Allocator, st: *Store, doc: FTeamFile) !void {
     try st.apply(.{ .sidebar_mode = doc.sidebar_mode });
     try st.apply(.{ .users = doc.users });
     const infos = try a.alloc(root.ChannelInfo, doc.channels.len);
-    for (doc.channels, 0..) |c, i| infos[i] = .{ .id = c.id, .name = c.name, .kind = c.kind, .user_id = c.user_id, .dormant = c.dormant };
+    for (doc.channels, 0..) |c, i| infos[i] = .{ .id = c.id, .name = c.name, .kind = c.kind, .user_id = c.user_id, .dormant = c.dormant, .section = c.section, .place = c.place, .section_rank = c.section_rank };
     try st.apply(.{ .channels = infos });
     // Which conversations Slack keeps open, and their newest activity
     var counts: std.ArrayList(root.UnreadInfo) = .empty;
