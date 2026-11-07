@@ -309,14 +309,16 @@ fn put(arena: std.mem.Allocator, list: *std.ArrayList(Def), def: Def) void {
     list.append(arena, def) catch {};
 }
 
-/// The built-in themes, then the ones in `<dir>/themes` (null: none). A
-/// file that is not a valid theme is skipped. Everything lives in `arena`.
-pub fn loadAll(arena: std.mem.Allocator, io: std.Io, dir: ?[]const u8) []const Def {
-    var list: std.ArrayList(Def) = .empty;
-    for (built_in) |data| if (parse(arena, data)) |d| put(arena, &list, d);
-    const root = dir orelse return list.items;
-    const path = std.fs.path.join(arena, &.{ root, "themes" }) catch return list.items;
-    var themes = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return list.items;
+/// Where user themes live under the config dir; a later one wins over an earlier
+pub const user_dirs = [_][]const []const u8{ &.{"themes"}, &.{ "custom", "themes" } };
+
+/// Adds the themes of `<dir>/<sub>/*.json`, in name order
+fn loadDir(arena: std.mem.Allocator, io: std.Io, list: *std.ArrayList(Def), root: []const u8, sub: []const []const u8) void {
+    var parts: std.ArrayList([]const u8) = .empty;
+    parts.append(arena, root) catch return;
+    parts.appendSlice(arena, sub) catch return;
+    const path = std.fs.path.join(arena, parts.items) catch return;
+    var themes = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return;
     defer themes.close(io);
     var names: std.ArrayList([]const u8) = .empty;
     var it = themes.iterate();
@@ -335,8 +337,17 @@ pub fn loadAll(arena: std.mem.Allocator, io: std.Io, dir: ?[]const u8) []const D
         const stem = name[0 .. name.len - ".json".len];
         if (def.id.len == 0) def.id = stem;
         if (def.name.len == 0) def.name = def.id;
-        put(arena, &list, def);
+        put(arena, list, def);
     }
+}
+
+/// The built-in themes, then the ones in `user_dirs` under `dir` (null:
+/// none). A file that is not a valid theme is skipped. Everything lives
+/// in `arena`.
+pub fn loadAll(arena: std.mem.Allocator, io: std.Io, dir: ?[]const u8) []const Def {
+    var list: std.ArrayList(Def) = .empty;
+    for (built_in) |data| if (parse(arena, data)) |d| put(arena, &list, d);
+    if (dir) |root| for (user_dirs) |sub| loadDir(arena, io, &list, root, sub);
     return list.items;
 }
 
@@ -421,11 +432,15 @@ test "user themes load from the themes directory; a same-id file replaces a buil
     try tmp.dir.writeFile(io, .{ .sub_path = "lax/themes/ocean.json", .data = "{\"id\":\"ocean\",\"name\":\"My Ocean\"}" });
     try tmp.dir.writeFile(io, .{ .sub_path = "lax/themes/broken.json", .data = "{nope" });
     try tmp.dir.writeFile(io, .{ .sub_path = "lax/themes/notes.txt", .data = "ignored" });
+    try tmp.dir.createDirPath(io, "lax/custom/themes");
+    try tmp.dir.writeFile(io, .{ .sub_path = "lax/custom/themes/extra.json", .data = "{\"name\":\"Extra\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "lax/custom/themes/mine.json", .data = "{\"name\":\"Custom Mine\"}" });
     const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/lax", .{tmp.sub_path});
     const defs = loadAll(arena, io, dir);
-    try std.testing.expectEqual(built_in.len + 1, defs.len);
-    const mine = find(defs, "mine").?;
-    try std.testing.expectEqualStrings("mine", mine.name);
+    try std.testing.expectEqual(built_in.len + 2, defs.len);
+    // custom/themes comes later and wins over themes
+    try std.testing.expectEqualStrings("Custom Mine", find(defs, "mine").?.name);
+    try std.testing.expectEqualStrings("Extra", find(defs, "extra").?.name);
     try std.testing.expectEqualStrings("My Ocean", find(defs, "ocean").?.name);
     try std.testing.expect(find(defs, "broken") == null);
 }

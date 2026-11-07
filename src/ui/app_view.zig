@@ -447,7 +447,12 @@ pub const State = struct {
             const it = tile.interaction();
             if (!active and it.clicked) s.pending_team = team.id;
             const drawn = team.icon.len > 0 and ui.image(c, .{ .key = team.id, .bytes = team.icon, .max_width = 40, .max_height = 40, .radius = 10, .scale = 1 });
-            if (!drawn) ui.text(c, initialOf(c, team.name), .{ .size = 20, .weight = .bold, .color = if (active) s.pal.on_primary_container else c.theme.muted });
+            if (!drawn) {
+                // No icon: the initial on a subtle rounded square
+                const sq = ui.div(c).w(40).h(40).center().rounded(10).bg(if (active) s.pal.primary_container else c.theme.text.alpha(0.08));
+                defer sq.end();
+                ui.text(c, initialOf(c, team.name), .{ .size = 20, .weight = .bold, .color = if (active) s.pal.on_primary_container else c.theme.muted });
+            }
             kit.tooltip(c, it, team.name, .{ .placement = .right, .delay = 0.3 });
         }
         ui.spacer(c);
