@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- WiX v4: `wix build -d Version=1.2.3 -d BinDir=zig-out\bin packaging\windows\lax.wxs`.
+     Add `-d WebView2Dll=1` when WebView2Loader.dll sits in BinDir. -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+    <Package Name="Lax" Manufacturer="Lax" Version="$(Version)" UpgradeCode="6f1b0b0e-3c1d-4f3a-9c55-5a0d1f0e7a21" Scope="perMachine">
+        <MajorUpgrade DowngradeErrorMessage="A newer version of Lax is already installed." />
+        <MediaTemplate EmbedCab="yes" />
+        <Icon Id="lax.ico" SourceFile="..\icon\lax.ico" />
+        <Property Id="ARPPRODUCTICON" Value="lax.ico" />
+
+        <StandardDirectory Id="ProgramFiles64Folder">
+            <Directory Id="INSTALLFOLDER" Name="Lax" />
+        </StandardDirectory>
+
+        <ComponentGroup Id="LaxFiles" Directory="INSTALLFOLDER">
+            <Component>
+                <File Id="LaxExe" Source="$(BinDir)\lax.exe" KeyPath="yes">
+                    <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="Lax" WorkingDirectory="INSTALLFOLDER" Icon="lax.ico" Advertise="yes" />
+                </File>
+            </Component>
+            <?ifdef WebView2Dll?>
+            <Component>
+                <File Source="$(BinDir)\WebView2Loader.dll" />
+            </Component>
+            <?endif?>
+        </ComponentGroup>
+
+        <Feature Id="Main" Title="Lax" Level="1">
+            <ComponentGroupRef Id="LaxFiles" />
+        </Feature>
+    </Package>
+</Wix>

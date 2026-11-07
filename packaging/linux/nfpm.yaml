@@ -1,0 +1,48 @@
+# deb and rpm: `packaging/package.sh deb|rpm` (env: VERSION, GOARCH, BIN, ICONS)
+name: lax
+arch: ${GOARCH}
+platform: linux
+version: ${VERSION}
+version_schema: semver
+section: net
+priority: optional
+maintainer: Wesley Bliss <wesley.bliss@gmail.com>
+description: |
+    A minimal, native Slack desktop client.
+    No webview: it reuses the session the Slack desktop app already has.
+homepage: https://github.com/wesleybliss/lax
+license: Proprietary
+contents:
+    - src: ${BIN}
+      dst: /usr/bin/lax
+      expand: true
+      file_info:
+          mode: 0755
+    - src: packaging/linux/dev.lax.Lax.desktop
+      dst: /usr/share/applications/dev.lax.Lax.desktop
+    - src: ${METAINFO}
+      dst: /usr/share/metainfo/dev.lax.Lax.metainfo.xml
+      expand: true
+    - src: packaging/icon/lax.svg
+      dst: /usr/share/icons/hicolor/scalable/apps/dev.lax.Lax.svg
+    - src: packaging/icon/lax-48.png
+      dst: /usr/share/icons/hicolor/48x48/apps/dev.lax.Lax.png
+    - src: packaging/icon/lax-256.png
+      dst: /usr/share/icons/hicolor/256x256/apps/dev.lax.Lax.png
+    - src: packaging/icon/lax-512.png
+      dst: /usr/share/icons/hicolor/512x512/apps/dev.lax.Lax.png
+overrides:
+    deb:
+        depends:
+            - libgtk-4-1 | libgtk-3-0
+            - libsecret-tools
+            - xdg-utils
+        recommends:
+            - fonts-noto-color-emoji
+    rpm:
+        depends:
+            - (gtk4 or gtk3)
+            - libsecret
+            - xdg-utils
+        recommends:
+            - google-noto-color-emoji-fonts

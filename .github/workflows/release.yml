@@ -1,0 +1,155 @@
+# Tag `vX.Y.Z` (or run by hand) to build every package and publish a GitHub release.
+# The version is the tag's; `build.zig.zon` is the default for local runs.
+name: release
+
+on:
+    push:
+        tags: ["v*"]
+    workflow_dispatch:
+        inputs:
+            version:
+                description: Version to build (no leading v)
+                required: true
+
+permissions:
+    contents: write
+
+env:
+    ZIG_VERSION: 0.17.0
+    VERSION: ${{ inputs.version || github.ref_name }}
+
+jobs:
+    linux:
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - { arch: x86_64, runner: ubuntu-latest }
+                    - { arch: aarch64, runner: ubuntu-24.04-arm }
+        runs-on: ${{ matrix.runner }}
+        steps:
+            - uses: actions/checkout@v4
+            - uses: mlugg/setup-zig@v2
+              with:
+                  version: ${{ env.ZIG_VERSION }}
+            - name: Version
+              run: echo "VERSION=${VERSION#v}" >> "$GITHUB_ENV"
+            - name: Test
+              run: zig build test
+            # glibc 2.31 keeps the binary running on older distros
+            - name: Build
+              run: zig build -Dtarget=${{ matrix.arch }}-linux-gnu.2.31 -Doptimize=ReleaseSafe
+            - name: Tools
+              run: |
+                  go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
+                  echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+                  sudo apt-get update
+                  sudo apt-get install -y zip flatpak flatpak-builder libfuse2t64 || sudo apt-get install -y zip flatpak flatpak-builder libfuse2
+                  flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+            - name: Packages
+              run: packaging/package.sh zip deb rpm appimage
+              env:
+                  ARCH: ${{ matrix.arch }}
+            # Untested in CI so far: the Flatpak build needs the GNOME runtime and libsecret to build
+            - name: Flatpak
+              continue-on-error: true
+              run: packaging/package.sh flatpak
+              env:
+                  ARCH: ${{ matrix.arch }}
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: linux-${{ matrix.arch }}
+                  path: |
+                      dist/*.zip
+                      dist/*.deb
+                      dist/*.rpm
+                      dist/*.AppImage
+                      dist/*.flatpak
+
+    macos:
+        runs-on: macos-14
+        steps:
+            - uses: actions/checkout@v4
+            - uses: mlugg/setup-zig@v2
+              with:
+                  version: ${{ env.ZIG_VERSION }}
+            - name: Version
+              run: echo "VERSION=${VERSION#v}" >> "$GITHUB_ENV"
+            - name: Build both architectures, then one universal binary
+              run: |
+                  zig build -Dtarget=aarch64-macos -Doptimize=ReleaseSafe -p out-arm
+                  zig build -Dtarget=x86_64-macos -Doptimize=ReleaseSafe -p out-x86
+                  mkdir -p out
+                  lipo -create out-arm/bin/lax out-x86/bin/lax -output out/lax
+            # Signing and notarizing happen when these secrets exist: MACOS_CERTIFICATE (base64 .p12),
+            # MACOS_CERTIFICATE_PASSWORD, MACOS_SIGN_IDENTITY, APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD.
+            # Without them the app is ad-hoc signed (users right-click > Open).
+            - name: Certificate
+              env:
+                  MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+                  MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+              run: |
+                  [ -n "$MACOS_CERTIFICATE" ] || exit 0
+                  echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+                  security create-keychain -p ci "$RUNNER_TEMP/ci.keychain"
+                  security set-keychain-settings -lut 21600 "$RUNNER_TEMP/ci.keychain"
+                  security unlock-keychain -p ci "$RUNNER_TEMP/ci.keychain"
+                  security import "$RUNNER_TEMP/cert.p12" -P "$MACOS_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$RUNNER_TEMP/ci.keychain"
+                  security set-key-partition-list -S apple-tool:,apple: -s -k ci "$RUNNER_TEMP/ci.keychain"
+                  security list-keychains -d user -s "$RUNNER_TEMP/ci.keychain" login.keychain
+            - name: Packages
+              run: packaging/package.sh app dmg zip
+              env:
+                  ARCH: universal
+                  BIN: out/lax
+                  MACOS_SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+                  APPLE_ID: ${{ secrets.APPLE_ID }}
+                  APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+                  APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+            # `app` is Lax.app itself: zipped for the release by the `zip` format
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: macos
+                  path: |
+                      dist/*.zip
+                      dist/*.dmg
+
+    windows:
+        runs-on: windows-latest
+        # Does not build yet: the websocket dependency has no Windows read path in Zig 0.17.
+        # Drop this once it does.
+        continue-on-error: true
+        steps:
+            - uses: actions/checkout@v4
+            - uses: mlugg/setup-zig@v2
+              with:
+                  version: ${{ env.ZIG_VERSION }}
+            - name: Version
+              shell: bash
+              run: echo "VERSION=${VERSION#v}" >> "$GITHUB_ENV"
+            - run: zig build -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe
+            - run: dotnet tool install --global wix
+            - run: packaging\windows\package.ps1 -Version $env:VERSION
+            - uses: actions/upload-artifact@v4
+              with:
+                  name: windows
+                  path: |
+                      dist/*.zip
+                      dist/*.msi
+
+    publish:
+        needs: [linux, macos, windows]
+        if: ${{ !cancelled() && needs.linux.result == 'success' && needs.macos.result == 'success' }}
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/download-artifact@v4
+              with:
+                  path: assets
+                  merge-multiple: true
+            - name: Checksums
+              run: cd assets && sha256sum * > SHA256SUMS
+            - name: Release
+              env:
+                  GH_TOKEN: ${{ github.token }}
+                  GH_REPO: ${{ github.repository }}
+              run: gh release create "${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}" assets/* --generate-notes --verify-tag=false

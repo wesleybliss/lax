@@ -41,3 +41,7 @@ Thumbs.db
 
 # Claude Code local state
 .claude/settings.local.json
+
+# Packaging output and tool downloads
+dist/
+.cache/

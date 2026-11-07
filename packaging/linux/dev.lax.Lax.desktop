@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Lax
+GenericName=Slack client
+Comment=A minimal, native Slack desktop client
+Exec=lax
+Icon=dev.lax.Lax
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+Keywords=slack;chat;messaging;
+StartupWMClass=lax

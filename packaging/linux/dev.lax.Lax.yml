@@ -1,0 +1,54 @@
+# Flatpak. `packaging/package.sh flatpak` stages the prebuilt binary in
+# dist/flatpak and builds with flatpak-builder (no network during the build).
+app-id: dev.lax.Lax
+runtime: org.gnome.Platform
+runtime-version: '50'
+sdk: org.gnome.Sdk
+command: lax
+finish-args:
+    - --share=network
+    - --share=ipc
+    - --socket=wayland
+    - --socket=fallback-x11
+    - --device=dri
+    # The saved session, and the cookie key, live in the Secret Service
+    - --talk-name=org.freedesktop.secrets
+    # Where the Slack desktop app keeps its session (read once at sign in)
+    - --filesystem=xdg-config/Slack:ro
+    - --filesystem=~/.var/app/com.slack.Slack/config/Slack:ro
+    - --filesystem=~/snap/slack/current/.config/Slack:ro
+modules:
+    # Lax runs `secret-tool`, which the runtime does not ship
+    - name: libsecret
+      buildsystem: meson
+      config-opts:
+          - -Dmanpage=false
+          - -Dgtk_doc=false
+          - -Dintrospection=false
+          - -Dvapi=false
+      sources:
+          - type: git
+            url: https://gitlab.gnome.org/GNOME/libsecret.git
+            tag: 0.21.7
+    - name: lax
+      buildsystem: simple
+      build-commands:
+          - install -Dm755 lax /app/bin/lax
+          - install -Dm644 dev.lax.Lax.desktop /app/share/applications/dev.lax.Lax.desktop
+          - install -Dm644 dev.lax.Lax.metainfo.xml /app/share/metainfo/dev.lax.Lax.metainfo.xml
+          - install -Dm644 lax.svg /app/share/icons/hicolor/scalable/apps/dev.lax.Lax.svg
+          - install -Dm644 lax-256.png /app/share/icons/hicolor/256x256/apps/dev.lax.Lax.png
+          - install -Dm644 lax-512.png /app/share/icons/hicolor/512x512/apps/dev.lax.Lax.png
+      sources:
+          - type: file
+            path: lax
+          - type: file
+            path: dev.lax.Lax.desktop
+          - type: file
+            path: dev.lax.Lax.metainfo.xml
+          - type: file
+            path: lax.svg
+          - type: file
+            path: lax-256.png
+          - type: file
+            path: lax-512.png
