@@ -898,6 +898,35 @@ test "threads page: loads on open, lists a thread, opens it" {
     try std.testing.expectEqualStrings("1700000000.000100", st.thread.?.ts);
 }
 
+test "drafts page: drafts, scheduled and sent entries open their conversation" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..3) |_| t.frame();
+    try t.clickText("Drafts & sent");
+    for (0..2) |_| t.frame();
+    try std.testing.expectEqual(store.FeedKind.drafts, fake.feed_kind.?);
+    try st.apply(.{ .feed = .{ .kind = .drafts, .entries = &.{
+        .{ .channel = "C1", .ts = "1700000000.000100", .user = "U1", .text = "half-written reply", .note = "Draft" },
+        .{ .channel = "D1", .ts = "1700000100.000100", .user = "U1", .text = "thanks <@U2>", .note = "Sent" },
+    } } });
+    for (0..3) |_| t.frame();
+    try std.testing.expect(t.hasText("Alex: half-written reply"));
+    try std.testing.expect(t.hasText("Alex: thanks @Grace"));
+    try std.testing.expect(t.hasText("Draft"));
+    try std.testing.expect(t.hasText("Sent"));
+    try t.clickText("Alex: half-written reply");
+    for (0..3) |_| t.frame();
+    try std.testing.expect(!t.hasText("Sent"));
+    try std.testing.expectEqualStrings("C1", state.selected.?);
+}
+
 test "rail: hovering a workspace names it" {
     const gpa = std.testing.allocator;
     var st = store.Store.init(gpa);

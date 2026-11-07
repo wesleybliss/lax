@@ -960,7 +960,8 @@ pub const Net = struct {
         var out: std.ArrayList(store.FeedEntryInfo) = .empty;
         switch (kind) {
             .threads => try n.threadsFeed(api, tmp.allocator(), ia, &out),
-            .drafts, .saved => return,
+            .drafts => try n.draftsFeed(api, tmp.allocator(), ia, &out),
+            .saved => return,
         }
         n.emit(.{ .arena = item_arena, .update = .{ .feed = .{ .kind = kind, .entries = out.items } } });
     }
@@ -989,6 +990,37 @@ pub const Net = struct {
                 .reply_text = if (newest) |r| try ia.dupe(u8, json.str(r, "text") orelse "") else "",
                 .unread = latest.len > 0 and store.tsLess(last_read, latest),
             });
+        }
+    }
+
+    /// Drafts & sent: your drafts, scheduled messages and sent ones
+    fn draftsFeed(n: *Net, api: *slack.http.Api, tmp: std.mem.Allocator, ia: std.mem.Allocator, out: *std.ArrayList(store.FeedEntryInfo)) SessionError!void {
+        const res = api.call(tmp, "drafts.list", &.{}) catch |err| return n.apiFailed(api, "drafts.list", err);
+        const drafts = json.arr(res.object, "drafts");
+        // Drafts first, then scheduled ones, then sent ones; each newest first as Slack lists them
+        for ([_][]const u8{ "Draft", "Scheduled", "Sent" }) |wanted| {
+            for (drafts) |dv| {
+                if (dv != .object) continue;
+                const o = dv.object;
+                if (json.flag(o, "is_deleted")) continue;
+                const scheduled = if (o.get("date_scheduled")) |v| (v == .integer and v.integer > 0) else false;
+                const label: []const u8 = if (json.flag(o, "is_sent")) "Sent" else if (scheduled) "Scheduled" else "Draft";
+                if (!std.mem.eql(u8, label, wanted)) continue;
+                const dests = json.arr(o, "destinations");
+                if (dests.len == 0 or dests[0] != .object) continue;
+                const channel = json.str(dests[0].object, "channel_id") orelse continue;
+                const sent_ts = json.str(dests[0].object, "message_ts") orelse "";
+                const ts = if (sent_ts.len > 0) sent_ts else json.str(o, "last_updated_ts") orelse "";
+                var text: std.ArrayList(u8) = .empty;
+                try richText(ia, &text, json.arr(o, "blocks"));
+                try out.append(ia, .{
+                    .channel = try ia.dupe(u8, channel),
+                    .ts = try ia.dupe(u8, ts),
+                    .user = try ia.dupe(u8, json.str(o, "user_id") orelse ""),
+                    .text = text.items,
+                    .note = label,
+                });
+            }
         }
     }
 
@@ -1236,6 +1268,31 @@ pub const Net = struct {
 };
 
 /// A user object to the name we show: display name, else real name, else handle
+/// The text of Block Kit rich text, in mrkdwn the renderer understands
+fn richText(arena: std.mem.Allocator, out: *std.ArrayList(u8), nodes: []const std.json.Value) std.mem.Allocator.Error!void {
+    for (nodes) |nv| {
+        if (nv != .object) continue;
+        const o = nv.object;
+        const kind = json.str(o, "type") orelse "";
+        if (std.mem.eql(u8, kind, "text")) {
+            try out.appendSlice(arena, json.str(o, "text") orelse "");
+        } else if (std.mem.eql(u8, kind, "link")) {
+            try out.appendSlice(arena, json.str(o, "url") orelse "");
+        } else if (std.mem.eql(u8, kind, "user")) {
+            try out.print(arena, "<@{s}>", .{json.str(o, "user_id") orelse ""});
+        } else if (std.mem.eql(u8, kind, "channel")) {
+            try out.print(arena, "<#{s}>", .{json.str(o, "channel_id") orelse ""});
+        } else if (std.mem.eql(u8, kind, "emoji")) {
+            try out.print(arena, ":{s}:", .{json.str(o, "name") orelse ""});
+        } else if (std.mem.eql(u8, kind, "broadcast")) {
+            try out.print(arena, "@{s}", .{json.str(o, "range") orelse "here"});
+        }
+        try richText(arena, out, json.arr(o, "elements"));
+        // Sections of a list or paragraphs run on a new line
+        if (std.mem.eql(u8, kind, "rich_text_list") or std.mem.eql(u8, kind, "rich_text_preformatted")) try out.append(arena, '\n');
+    }
+}
+
 /// The sections in sidebar order: Slack links each to the next one
 fn sectionOrder(arena: std.mem.Allocator, sections: []const std.json.Value) std.mem.Allocator.Error![]const std.json.Value {
     var out: std.ArrayList(std.json.Value) = .empty;
@@ -1286,6 +1343,20 @@ fn normalizeUrl(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Err
     const host = t[0..host_end];
     if (host.len == 0) return gpa.dupe(u8, "");
     return std.fmt.allocPrint(gpa, "https://{s}", .{host});
+}
+
+test "richText flattens rich text blocks" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const doc = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\[{"type":"rich_text","elements":[{"type":"rich_text_section","elements":[
+        \\ {"type":"text","text":"hi "},{"type":"user","user_id":"U1"},{"type":"text","text":" see "},
+        \\ {"type":"link","url":"https://example.com"},{"type":"emoji","name":"tada"}]}]}]
+    , .{});
+    var out: std.ArrayList(u8) = .empty;
+    try richText(a, &out, doc.array.items);
+    try std.testing.expectEqualStrings("hi <@U1> see https://example.com:tada:", out.items);
 }
 
 test "sectionOrder follows the next links" {
