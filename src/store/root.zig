@@ -15,11 +15,16 @@ test {
 
 pub const Kind = enum { channel, private, im, mpim };
 
+/// A `fetch_image` id with this prefix asks for a user's profile picture (the rest is the user id)
+pub const avatar_prefix = "avatar:";
+
 pub const User = struct {
     id: []const u8,
     name: []const u8,
     /// An app or bot: its DM goes under Apps
     is_bot: bool = false,
+    /// URL of the profile picture (empty: none)
+    image: []const u8 = "",
 };
 
 /// Where Slack's channel sections put a conversation in the sidebar
@@ -181,6 +186,8 @@ pub const Update = union(enum) {
     edited: struct { channel: []const u8, ts: []const u8, text: []const u8, files: []const FileInfo = &.{} },
     /// A file's preview picture, encoded (PNG, JPEG, ...)
     file_image: struct { id: []const u8, bytes: []const u8 },
+    /// A user's profile picture, encoded
+    avatar: struct { user: []const u8, bytes: []const u8 },
     deleted: struct { channel: []const u8, ts: []const u8 },
     /// Read up to `ts` on another client (or this one); counts when Slack says
     marked: struct { channel: []const u8, ts: []const u8, unread: ?u32 = null, mentions: ?u32 = null },
@@ -293,7 +300,7 @@ pub const Channel = struct {
 
 pub const max_messages_per_channel = 1000;
 
-const StoredUser = struct { id: []u8, name: []u8, online: bool = false, is_bot: bool = false };
+const StoredUser = struct { id: []u8, name: []u8, online: bool = false, is_bot: bool = false, image: []u8 = &.{}, avatar: []u8 = &.{} };
 
 pub const Team = struct { id: []u8, name: []u8, url: []u8, icon: []u8 = &.{} };
 
@@ -408,6 +415,8 @@ pub const Store = struct {
         while (it.next()) |u| {
             s.gpa.free(u.id);
             s.gpa.free(u.name);
+            s.gpa.free(u.image);
+            s.gpa.free(u.avatar);
         }
         sp.users.deinit(s.gpa);
         for (sp.channels.items) |*c| s.freeChannel(c);
@@ -612,6 +621,17 @@ pub const Store = struct {
         return if (s.users.get(uid)) |u| u.is_bot else false;
     }
 
+    /// Where a user's profile picture is (empty: none)
+    pub fn userImageUrl(s: *const Store, id: []const u8) []const u8 {
+        return if (s.users.get(id)) |u| u.image else "";
+    }
+
+    /// A user's profile picture, if it has arrived
+    pub fn userAvatar(s: *const Store, id: []const u8) ?[]const u8 {
+        const u = s.users.get(id) orelse return null;
+        return if (u.avatar.len > 0) u.avatar else null;
+    }
+
     pub fn isOnline(s: *const Store, user_id: []const u8) bool {
         return if (s.users.get(user_id)) |u| u.online else false;
     }
@@ -733,6 +753,7 @@ pub const Store = struct {
                 }
                 gop.value_ptr.* = bytes;
             },
+            .avatar => |a| if (s.users.getPtr(a.user)) |user| try s.replace(&user.avatar, a.bytes),
             .deleted => |d| {
                 const c = s.channel(d.channel) orelse return;
                 const i = findTs(c.messages.items, d.ts) orelse return;
@@ -938,13 +959,17 @@ pub const Store = struct {
         if (s.users.getPtr(user.id)) |existing| {
             try s.replace(&existing.name, user.name);
             existing.is_bot = user.is_bot;
+            // A new picture URL makes the held picture stale; keep it until the new one arrives
+            if (user.image.len > 0) try s.replace(&existing.image, user.image);
             return;
         }
         const id = try s.gpa.dupe(u8, user.id);
         errdefer s.gpa.free(id);
         const name = try s.gpa.dupe(u8, user.name);
         errdefer s.gpa.free(name);
-        try s.users.put(s.gpa, id, .{ .id = id, .name = name, .is_bot = user.is_bot });
+        const image = try s.gpa.dupe(u8, user.image);
+        errdefer s.gpa.free(image);
+        try s.users.put(s.gpa, id, .{ .id = id, .name = name, .is_bot = user.is_bot, .image = image });
     }
 
     fn upsertChannel(s: *Store, info: ChannelInfo) std.mem.Allocator.Error!void {

@@ -1120,6 +1120,12 @@ pub const Net = struct {
         n.dbg("fetching file preview {s}", .{id});
         var item_arena = std.heap.ArenaAllocator.init(n.gpa);
         const ia = item_arena.allocator();
+        if (std.mem.startsWith(u8, id, store.avatar_prefix)) {
+            // A profile picture: a public URL, so no session credentials go with it
+            const bytes = api.download(ia, url, 1 << 20) catch return item_arena.deinit();
+            const user = ia.dupe(u8, id[store.avatar_prefix.len..]) catch return item_arena.deinit();
+            return n.emit(.{ .arena = item_arena, .update = .{ .avatar = .{ .user = user, .bytes = bytes } } });
+        }
         const bytes = api.downloadPrivate(ia, url, 8 << 20) catch |err| {
             n.dbg("file preview failed: {s}", .{@errorName(err)});
             return item_arena.deinit();
@@ -1562,7 +1568,8 @@ fn userOf(arena: std.mem.Allocator, o: std.json.ObjectMap) std.mem.Allocator.Err
     const display = if (profile) |p| json.str(p, "display_name") orelse "" else "";
     const real = if (profile) |p| json.str(p, "real_name") orelse "" else "";
     const name = if (display.len > 0) display else if (real.len > 0) real else json.str(o, "name") orelse id;
-    return .{ .id = try arena.dupe(u8, id), .name = try arena.dupe(u8, name), .is_bot = json.flag(o, "is_bot") or json.flag(o, "is_app_user") };
+    const image = if (profile) |p| json.str(p, "image_72") orelse json.str(p, "image_48") orelse "" else "";
+    return .{ .id = try arena.dupe(u8, id), .name = try arena.dupe(u8, name), .is_bot = json.flag(o, "is_bot") or json.flag(o, "is_app_user"), .image = try arena.dupe(u8, image) };
 }
 
 fn normalizeUrl(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error![]u8 {

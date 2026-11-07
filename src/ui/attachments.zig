@@ -68,11 +68,11 @@ pub const Pending = struct {
         defer row.end();
         var remove: ?usize = null;
         for (p.items.items[0..@min(p.items.items.len, max_chips)], 0..) |path, i| {
-            const chip = ui.div(c).row().itemsCenter().gap(6).h(chip_h).maxW(220).pl(12).pr(4).roundedFull().circular().bg(pal.container_high).border(c.theme.border).borderW(1);
+            const chip = ui.div(c).row().itemsCenter().gap(6).h(chip_h).maxW(220).pl(12).pr(4).rounded(8).bg(pal.container_high).border(c.theme.border).borderW(1);
             defer chip.end();
             ui.text(c, "📎", .{ .size = 13 });
             ui.text(c, c.alloc().dupe(u8, std.fs.path.basename(path)) catch "file", .{ .size = 13, .truncate = .ellipsis });
-            const x = ui.div(c).w(22).h(22).center().roundedFull().circular().control().hover(c.theme.surface_hover);
+            const x = ui.div(c).w(22).h(22).center().rounded(6).control().hover(c.theme.surface_hover);
             defer x.end();
             if (x.clicked()) remove = i;
             ui.text(c, "✕", .{ .size = 11, .color = c.theme.muted });

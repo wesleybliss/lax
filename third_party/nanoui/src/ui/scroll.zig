@@ -146,6 +146,20 @@ fn scrubTo(c: *Context, id: u64, g: ScrollbarGeom, thumb_top: f32) void {
     c.changed = true;
 }
 
+/// Whether the box with `id` sits inside node `outer` (a popover's panel holds
+/// the list that scrolls in it: that panel is not a control in the bar's way)
+fn isInside(c: *Context, id: u64, outer: u32) bool {
+    for (c.nodes.items) |n| {
+        if (n.id != id) continue;
+        var at = n.parent;
+        while (at != none) : (at = c.node(at).parent) {
+            if (at == outer) return true;
+        }
+        return false;
+    }
+    return false;
+}
+
 pub fn tryPressScrollbar(c: *Context) bool {
     if (c.input.button != .left or (@import("keys.zig").mac and c.input.ctrl)) return false;
     const m = c.input.mouse;
@@ -158,7 +172,6 @@ pub fn tryPressScrollbar(c: *Context) bool {
     // the scroll box's right side is under the track, and the press is the
     // button's. Without this the 10 points of track swallow it and the button
     // never fires.
-    if (c.hot_index != none and c.hot_index < c.nodes.items.len and c.node(c.hot_index).interactive) return false;
     var found: ?struct { id: u64, g: ScrollbarGeom } = null;
     var it = c.scrollbars.iterator();
     while (it.next()) |e| {
@@ -168,6 +181,7 @@ pub fn tryPressScrollbar(c: *Context) bool {
         }
     }
     const f = found orelse return false;
+    if (c.hot_index != none and c.hot_index < c.nodes.items.len and c.node(c.hot_index).interactive and !isInside(c, f.id, c.hot_index)) return false;
     if (m.y >= f.g.thumb_y and m.y <= f.g.thumb_y + f.g.thumb_h) {
         c.scrollbar_drag = .{ .id = f.id, .grab_dy = m.y - f.g.thumb_y };
     } else {

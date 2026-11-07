@@ -353,7 +353,7 @@ pub const Composer = struct {
     }
 
     fn popup(k: *Composer, c: *ui.Context, pal: theme.Palette, tok: Token, items: []const Candidate) void {
-        const card = ui.div(c).column().wFull().p(6).rounded(16).bg(pal.container_high).border(c.theme.border).borderW(1);
+        const card = ui.div(c).column().wFull().p(6).rounded(12).bg(pal.container_high).border(c.theme.border).borderW(1);
         defer card.end();
         var picked: ?usize = null;
         for (items, 0..) |cand, i| {

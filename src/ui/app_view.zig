@@ -35,7 +35,13 @@ const composer_lines: u8 = 2;
 const composer_tall_lines: u8 = 10;
 /// DMs quiet for longer than this fold away behind "Show older"
 const rail_w: f32 = 76;
-const nav_h: f32 = 40;
+const font_row_h: f32 = 32;
+const font_list_h: f32 = 320;
+/// Corner radius of rows, buttons and chips (pills and circles are too round)
+const radius: f32 = 8;
+/// Width the sidebar's icon column takes: `#`, an emoji, or a small avatar
+const nav_icon: f32 = 24;
+const nav_avatar: f32 = 24;
 
 const time_style: ui.TextStyle = .{ .size = 12 };
 const group_secs = 5 * 60;
@@ -244,6 +250,12 @@ pub const State = struct {
     /// Installed font families, found the first time Settings opens
     font_names: ?[]const []const u8 = null,
     user_menu_open: bool = false,
+    /// The sidebar's search: only conversations matching it are listed
+    filter: ui.TextBuffer = .{},
+    /// The workspace `settings` belong to (owned; empty before one is known)
+    settings_team: []u8 = &.{},
+    /// A font list just opened: scroll to the chosen font on its first frame
+    font_reveal: [2]bool = .{ false, false },
     self_away: bool = false,
     /// The fonts and zoom handed to nanoui last frame
     applied_ui_font: []const u8 = "",
@@ -284,6 +296,8 @@ pub const State = struct {
         s.manual_url.deinit();
         s.manual_token.deinit();
         s.manual_cookie.deinit();
+        s.filter.deinit();
+        s.gpa.free(s.settings_team);
         s.thread_composer.deinit();
         s.edit_composer.deinit();
         s.menu.deinit();
@@ -425,6 +439,7 @@ pub const State = struct {
     // View
 
     pub fn view(s: *State, c: *ui.Context) void {
+        s.syncSettingsTeam();
         s.applyTheme(c);
         s.applyFonts(c);
         s.trackLayout(c);
@@ -507,6 +522,7 @@ pub const State = struct {
         s.list_rev = 0;
         s.main_composer.clear();
         s.main_attach.clear();
+        s.filter.clear();
         s.cancelEdit();
         s.menu.closeAll();
         s.dropImages();
@@ -520,7 +536,7 @@ pub const State = struct {
         defer col.end();
         for (s.store.teams.items) |team| {
             const active = std.mem.eql(u8, team.id, s.store.active_team);
-            var tile = ui.div(c).w(52).h(52).center().rounded(16).control();
+            var tile = ui.div(c).w(52).h(52).center().rounded(12).control();
             tile = tile.bg(if (active) s.pal.secondary_container else c.theme.surface_hover.alpha(0));
             tile = tile.hover(if (active) s.pal.secondary_container else c.theme.surface_hover);
             defer tile.end();
@@ -542,7 +558,7 @@ pub const State = struct {
     /// Your avatar at the bottom of the rail; opens the account menu
     fn userTile(s: *State, c: *ui.Context) void {
         const name = s.store.userName(s.store.self_id) orelse "";
-        const tile = ui.div(c).w(52).h(52).center().roundedFull().circular().control();
+        const tile = ui.div(c).w(52).h(52).center().rounded(12).control();
         defer tile.end();
         const it = tile.interaction();
         if (it.clicked) s.user_menu_open = !s.user_menu_open;
@@ -556,10 +572,31 @@ pub const State = struct {
         s.userMenu(c, it.rect, name);
     }
 
+    /// A user's picture on a rounded square (like Slack's), or their initial on a
+    /// tonal tile until it arrives (or when they have none)
     fn avatar(s: *State, c: *ui.Context, name: []const u8, id: []const u8, size: f32, text_size: f32) void {
-        const av = ui.div(c).w(size).h(size).roundedFull().circular().bg(theme.avatarColor(s.pal, if (id.len > 0) id else name)).center();
+        const corner = @round(size * 0.2);
+        if (id.len > 0) {
+            if (s.store.userAvatar(id)) |bytes| {
+                if (ui.image(c, .{ .key = c.print("{s}{s}", .{ store.avatar_prefix, id }), .bytes = bytes, .max_width = size, .max_height = size, .radius = corner, .scale = 1 })) return;
+            } else s.wantAvatar(id);
+        }
+        const av = ui.div(c).w(size).h(size).rounded(corner).bg(theme.avatarColor(s.pal, if (id.len > 0) id else name)).center();
         defer av.end();
         ui.text(c, initialOf(c, name), .{ .size = text_size, .weight = .semibold, .color = ui.Color.white });
+    }
+
+    /// Asks for a user's picture once; it shows when it arrives
+    fn wantAvatar(s: *State, id: []const u8) void {
+        const url = s.store.userImageUrl(id);
+        if (url.len == 0) return;
+        const key = std.fmt.allocPrint(s.gpa, "{s}{s}", .{ store.avatar_prefix, id }) catch return;
+        const gop = s.images_asked.getOrPut(s.gpa, key) catch {
+            s.gpa.free(key);
+            return;
+        };
+        if (gop.found_existing) return s.gpa.free(key);
+        s.actions.fetch_image(s.actions.ctx, key, url);
     }
 
     fn userMenu(s: *State, c: *ui.Context, anchor: ?ui.Rect, name: []const u8) void {
@@ -627,7 +664,7 @@ pub const State = struct {
     fn manualScreen(s: *State, c: *ui.Context, reason: []const u8) void {
         const root = ui.div(c).column().sizeFull().center().bg(c.theme.background);
         defer root.end();
-        const card = ui.div(c).column().w(560).gap(14).p(28).rounded(24).bg(s.pal.container);
+        const card = ui.div(c).column().w(560).gap(14).p(28).rounded(16).bg(s.pal.container);
         defer card.end();
         ui.text(c, "Sign in to Slack", .{ .size = 22, .weight = .bold });
         ui.text(c, reason, .{ .size = 14, .color = c.theme.danger, .wrap = true });
@@ -682,7 +719,27 @@ pub const State = struct {
     }
 
     fn saveSettings(s: *State) void {
-        if (s.layout_dir) |dir| settings_mod.save(s.gpa, s.io, dir, s.settings);
+        if (s.layout_dir) |dir| settings_mod.saveTeam(s.gpa, s.io, dir, s.settings_team, s.settings);
+    }
+
+    /// Settings and themes belong to a workspace: when the shown one changes,
+    /// take that workspace's own (before it has any, the shared ones)
+    fn syncSettingsTeam(s: *State) void {
+        const id = s.store.active_team;
+        if (id.len == 0 or std.mem.eql(u8, id, s.settings_team)) return;
+        const copy = s.gpa.dupe(u8, id) catch return;
+        s.gpa.free(s.settings_team);
+        s.settings_team = copy;
+        const dir = s.layout_dir orelse return;
+        var arena = std.heap.ArenaAllocator.init(s.gpa);
+        defer arena.deinit();
+        s.applySettings(settings_mod.loadTeam(arena.allocator(), s.io, dir, id));
+        s.font_open = .{ false, false };
+    }
+
+    /// Height of a sidebar row
+    fn rowH(s: *const State) f32 {
+        return @floatFromInt(s.settings.sidebar_row);
     }
 
     /// (Re)reads the themes: the built-in ones and those in the config dir
@@ -773,7 +830,7 @@ pub const State = struct {
             defer head.end();
             ui.text(c, "Settings", .{ .size = 18, .weight = .bold });
             ui.spacer(c);
-            const close = ui.div(c).w(32).h(32).center().roundedFull().circular().control().hover(c.theme.surface_hover);
+            const close = ui.div(c).w(32).h(32).center().rounded(radius).control().hover(c.theme.surface_hover);
             defer close.end();
             if (close.clicked() or (!s.font_open[0] and !s.font_open[1] and c.shortcut(.{ .key = ui.Shortcut.escape }))) s.settings_open = false;
             ui.text(c, "✕", .{ .size = 14, .color = c.theme.muted });
@@ -828,6 +885,29 @@ pub const State = struct {
         }
 
         ui.div(c).h(8).end();
+        ui.text(c, "Sidebar", .{ .size = 16, .weight = .bold });
+        {
+            const row = s.settingRow(c, "Spacing");
+            defer row.end();
+            const presets = [_]u16{ settings_mod.row_compact, settings_mod.row_comfortable, settings_mod.row_cozy };
+            // No tab is lit when the number was set to something else
+            var picked: usize = presets.len;
+            for (presets, 0..) |p, i| if (p == s.settings.sidebar_row) {
+                picked = i;
+            };
+            if (kit.tabs(c, &.{ "Compact", "Comfortable", "Cozy" }, &picked, .{ .variant = .segmented }) and picked < presets.len) {
+                s.settings.sidebar_row = presets[picked];
+                changed = true;
+            }
+            var px: f64 = @floatFromInt(s.settings.sidebar_row);
+            if (kit.numberInput(c, &px, .{ .min = settings_mod.row_min, .max = settings_mod.row_max, .step = 2, .width = 110 })) {
+                s.settings.sidebar_row = @intFromFloat(px);
+                changed = true;
+            }
+            ui.text(c, "px", .{ .size = 13, .color = c.theme.muted });
+        }
+
+        ui.div(c).h(8).end();
         ui.text(c, "Chat", .{ .size = 16, .weight = .bold });
         {
             const row = s.settingRow(c, "Font");
@@ -851,7 +931,7 @@ pub const State = struct {
         ui.div(c).h(8).end();
         ui.text(c, "Preview", .{ .size = 16, .weight = .bold });
         {
-            const card = ui.div(c).column().wFull().gap(4).p(16).rounded(16).bg(s.pal.container);
+            const card = ui.div(c).column().wFull().gap(4).p(16).rounded(12).bg(s.pal.container);
             defer card.end();
             ui.text(c, "Grace", s.nameStyle());
             ui.text(c, "The quick brown fox jumps over the lazy dog. 0123456789", s.bodyStyle());
@@ -883,7 +963,7 @@ pub const State = struct {
     fn themeCard(s: *State, c: *ui.Context, d: *const theme.Def, selected: bool) bool {
         const r = theme.resolve(d, s.dark);
         ui.key(c, c.print("theme-{s}", .{d.id}));
-        var card = ui.div(c).column().w(136).h(84).p(12).gap(10).rounded(16).bg(r.theme.background).control();
+        var card = ui.div(c).column().w(136).h(84).p(12).gap(10).rounded(12).bg(r.theme.background).control();
         card = if (selected) card.border(r.theme.accent).borderW(2) else card.border(c.theme.border).borderW(1);
         defer card.end();
         ui.text(c, if (d.name.len > 0) d.name else d.id, .{ .size = 14, .weight = .semibold, .color = r.theme.text, .truncate = .ellipsis });
@@ -910,7 +990,7 @@ pub const State = struct {
     /// the family picked ("" for the default entry).
     fn fontPicker(s: *State, c: *ui.Context, which: usize, current: []const u8, default_label: []const u8) ?[]const u8 {
         var chosen: ?[]const u8 = null;
-        const btn = ui.div(c).row().w(280).h(40).px(14).gap(6).itemsCenter().rounded(12).bg(s.pal.container_high).border(c.theme.border).borderW(1).control();
+        const btn = ui.div(c).row().w(280).h(40).px(14).gap(6).itemsCenter().rounded(radius).bg(s.pal.container_high).border(c.theme.border).borderW(1).control();
         const it = btn.interaction();
         {
             defer btn.end();
@@ -918,12 +998,28 @@ pub const State = struct {
             ui.spacer(c);
             ui.text(c, "▾", .{ .size = 12, .color = c.theme.muted });
         }
-        if (it.clicked) s.font_open[which] = !s.font_open[which];
+        if (it.clicked) {
+            s.font_open[which] = !s.font_open[which];
+            s.font_reveal[which] = s.font_open[which];
+        }
         const names = if (s.font_open[which]) s.loadFontNames(c) else &[_][]const u8{};
         const p = kit.popover(c, if (which == 0) "font-ui" else "font-chat", &s.font_open[which], it.rect, .{ .placement = .bottom_start, .width = 280, .padding = 6 }) orelse return null;
         defer p.end();
-        const list = ui.div(c).column().wFull().h(320).scrollY();
+        // Rows stop short of the right edge: a press there belongs to the
+        // scrollbar, which a row reaching it would take (no dragging the thumb)
+        const list = ui.div(c).column().wFull().h(font_list_h).pr(12).scrollY();
         defer list.end();
+        if (s.font_reveal[which]) {
+            // Opened: show the chosen font, in the middle of the list
+            s.font_reveal[which] = false;
+            var at: usize = 0;
+            if (current.len > 0) for (names, 1..) |name, i| if (std.ascii.eqlIgnoreCase(name, current)) {
+                at = i;
+                break;
+            };
+            const top = @as(f32, @floatFromInt(at)) * font_row_h - (font_list_h - font_row_h) / 2;
+            c.scroll.put(c.gpa, c.node(list.index).id, @max(0, top)) catch {};
+        }
         if (s.fontRow(c, 0, default_label, current.len == 0)) chosen = "";
         for (names, 1..) |name, i| {
             if (s.fontRow(c, i, name, std.ascii.eqlIgnoreCase(name, current))) chosen = name;
@@ -934,7 +1030,7 @@ pub const State = struct {
 
     fn fontRow(s: *State, c: *ui.Context, i: usize, label: []const u8, selected: bool) bool {
         ui.key(c, c.print("font-{d}", .{i}));
-        var row = ui.div(c).row().wFull().h(32).px(10).itemsCenter().rounded(8).control();
+        var row = ui.div(c).row().wFull().h(font_row_h).px(10).itemsCenter().rounded(radius).control();
         if (selected) row = row.bg(s.pal.secondary_container);
         row = row.hover(if (selected) s.pal.secondary_container else c.theme.surface_hover);
         defer row.end();
@@ -1012,10 +1108,12 @@ pub const State = struct {
             defer head.end();
             ui.text(c, s.activeTeamName(), .{ .weight = .bold, .size = 18 });
         }
+        s.filterBox(c);
         const scroller = ui.div(c).column().wFull().grow().scrollY().px(12).pb(12);
         defer scroller.end();
 
-        s.topRows(c);
+        const filtering = s.filter.text().len > 0;
+        if (!filtering) s.topRows(c);
 
         const st = s.store;
         var lists: [6]std.ArrayList(*store.Channel) = @splat(.empty);
@@ -1065,30 +1163,72 @@ pub const State = struct {
         std.mem.sort(*store.Channel, apps.items, ctx, Ctx.byActivity);
 
         // Slack's order: Starred, the user's own sections, Channels, Direct messages, Apps
-        if (s.anyNamed(starred.items)) {
+        if (s.hasRows(starred.items)) {
             s.sectionHeader(c, "Starred");
             _ = s.sectionRows(c, starred.items, true);
         }
         s.customSections(c, above.items);
-        s.sectionHeader(c, "Channels");
-        const hidden_chans = s.sectionRows(c, chans.items, s.show_hidden_chans);
-        if (hidden_chans > 0 or s.show_hidden_chans) s.hiddenToggle(c, &s.show_hidden_chans, hidden_chans);
-        s.sectionHeader(c, "Direct messages");
-        const hidden_dms = s.sectionRows(c, dms.items, s.show_hidden_dms);
-        if (hidden_dms > 0 or s.show_hidden_dms) s.hiddenToggle(c, &s.show_hidden_dms, hidden_dms);
+        s.listSection(c, "Channels", chans.items, &s.show_hidden_chans, true);
+        s.listSection(c, "Direct messages", dms.items, &s.show_hidden_dms, true);
         s.customSections(c, below.items);
-        if (s.anyNamed(apps.items)) {
-            s.sectionHeader(c, "Apps");
-            const hidden_apps = s.sectionRows(c, apps.items, s.show_hidden_apps);
-            if (hidden_apps > 0 or s.show_hidden_apps) s.hiddenToggle(c, &s.show_hidden_apps, hidden_apps);
+        s.listSection(c, "Apps", apps.items, &s.show_hidden_apps, false);
+        if (filtering and !s.anyMatch(st.channels.items)) {
+            const none = ui.div(c).wFull().px(16).pt(20);
+            defer none.end();
+            ui.text(c, "No conversations match", .{ .size = 14, .color = c.theme.muted });
         }
+    }
+
+    /// The search box above the conversations; Esc empties it
+    fn filterBox(s: *State, c: *ui.Context) void {
+        const wrap = ui.div(c).wFull().px(12).pb(8);
+        defer wrap.end();
+        const box = ui.div(c).row().wFull().h(36).px(10).gap(8).itemsCenter().rounded(radius).bg(s.pal.container_high).border(c.theme.border).borderW(1);
+        defer box.end();
+        ui.icon(c, "magnifyingglass", .{ .size = 15, .frame = 18, .color = c.theme.muted });
+        const res = ui.textField(c, &s.filter, .{ .placeholder = "Find a conversation…", .width = .fill, .size = 14, .bare = true });
+        if (res.focused and c.shortcut(.{ .key = ui.Shortcut.escape })) s.filter.clear();
+        if (s.filter.text().len == 0) return;
+        const x = ui.div(c).w(22).h(22).center().rounded(6).control().hover(c.theme.surface_hover);
+        defer x.end();
+        if (x.clicked()) s.filter.clear();
+        ui.icon(c, "xmark", .{ .size = 12, .frame = 14, .color = c.theme.muted });
+    }
+
+    /// Whether a conversation's name has the search text in it
+    fn matches(s: *State, ch: *const store.Channel) bool {
+        return std.ascii.findIgnoreCase(s.store.channelName(ch), s.filter.text()) != null;
+    }
+
+    fn anyMatch(s: *State, list: []const store.Channel) bool {
+        for (list) |*ch| if (s.matches(ch)) return true;
+        return false;
+    }
+
+    /// Whether a section has anything to list: named rows, matching the search when there is one
+    fn hasRows(s: *State, list: []const *store.Channel) bool {
+        if (s.filter.text().len == 0) return s.anyNamed(list);
+        for (list) |ch| if (s.matches(ch)) return true;
+        return false;
+    }
+
+    /// A section with its header and rows, and the toggle for what the sidebar preference hides.
+    /// A search lists every match and no toggle. `always`: shown while empty.
+    fn listSection(s: *State, c: *ui.Context, label: []const u8, list: []const *store.Channel, show_hidden: *bool, always: bool) void {
+        const filtering = s.filter.text().len > 0;
+        if (filtering or !always) {
+            if (!s.hasRows(list)) return;
+        }
+        s.sectionHeader(c, label);
+        const hidden = s.sectionRows(c, list, show_hidden.*);
+        if (!filtering and (hidden > 0 or show_hidden.*)) s.hiddenToggle(c, show_hidden, hidden);
     }
 
     /// Threads, Huddles, Drafts & sent and Saved
     fn topRows(s: *State, c: *ui.Context) void {
         inline for (.{ TopView.threads, TopView.huddles, TopView.drafts, TopView.saved }) |v| {
             const active = s.top_view == v;
-            var row = ui.div(c).row().itemsCenter().gap(12).wFull().h(nav_h).px(16).control().roundedFull().circular();
+            var row = ui.div(c).row().itemsCenter().gap(10).wFull().h(s.rowH()).px(16).control().rounded(radius);
             if (active) row = row.bg(s.pal.secondary_container);
             row = row.hover(if (active) s.pal.secondary_container else c.theme.surface_hover);
             defer row.end();
@@ -1096,7 +1236,7 @@ pub const State = struct {
                 s.top_view = v;
                 s.settings_open = false;
             }
-            const icon = ui.div(c).w(20).h(nav_h).center();
+            const icon = ui.div(c).w(nav_icon).h(s.rowH()).center();
             ui.text(c, v.glyph(), .{ .size = 15 });
             icon.end();
             ui.text(c, v.label(), .{ .size = 15, .weight = if (active) .semibold else .regular, .color = if (active) c.theme.text else c.theme.muted });
@@ -1188,7 +1328,7 @@ pub const State = struct {
             var to = from + 1;
             while (to < list.len and list[to].section_rank == list[from].section_rank) to += 1;
             const group = list[from..to];
-            if (s.anyNamed(group)) {
+            if (s.hasRows(group)) {
                 s.sectionHeader(c, if (group[0].section.len > 0) group[0].section else "Section");
                 _ = s.sectionRows(c, group, true);
             }
@@ -1203,7 +1343,9 @@ pub const State = struct {
             const is_sel = if (s.selected) |id| std.mem.eql(u8, id, ch.id) else false;
             // Names still loading: show nothing rather than an ID
             if (s.store.channelName(ch).len == 0) continue;
-            if (!(is_sel or show_all or s.store.shownInSidebar(ch))) {
+            if (s.filter.text().len > 0) {
+                if (!s.matches(ch)) continue;
+            } else if (!(is_sel or show_all or s.store.shownInSidebar(ch))) {
                 hidden += 1;
                 continue;
             }
@@ -1214,7 +1356,7 @@ pub const State = struct {
 
     /// "Show 6 hidden" / "Show fewer" under a section
     fn hiddenToggle(s: *State, c: *ui.Context, flag: *bool, hidden: usize) void {
-        const row = ui.div(c).row().itemsCenter().wFull().h(32).px(16).roundedFull().circular().control().hover(c.theme.surface_hover);
+        const row = ui.div(c).row().itemsCenter().wFull().h(32).px(16).rounded(radius).control().hover(c.theme.surface_hover);
         defer row.end();
         if (row.clicked()) flag.* = !flag.*;
         const label = if (flag.*) "Show fewer" else c.print("Show {d} hidden", .{hidden});
@@ -1254,7 +1396,7 @@ pub const State = struct {
 
     fn channelRow(s: *State, c: *ui.Context, ch: *store.Channel) void {
         const is_sel = s.top_view == .none and (if (s.selected) |id| std.mem.eql(u8, id, ch.id) else false);
-        var row = ui.div(c).row().itemsCenter().gap(12).wFull().h(nav_h).px(16).control().roundedFull().circular();
+        var row = ui.div(c).row().itemsCenter().gap(10).wFull().h(s.rowH()).px(16).control().rounded(radius);
         if (is_sel) row = row.bg(s.pal.secondary_container);
         row = row.hover(if (is_sel) s.pal.secondary_container else c.theme.surface_hover);
         defer row.end();
@@ -1264,26 +1406,37 @@ pub const State = struct {
         const prefix: []const u8 = switch (ch.kind) {
             .channel => "#",
             .private => "🔒",
-            .im => "●",
+            .im => "",
             .mpim => "👥",
         };
         const tone = if (ch.unread or is_sel) c.theme.text else c.theme.muted;
-        const icon = ui.div(c).w(20).h(nav_h).center();
+        const icon = ui.div(c).w(nav_icon).h(s.rowH()).center();
         if (ch.kind == .im) {
-            const online = if (ch.user_id) |u| s.store.isOnline(u) else false;
-            const dot = ui.div(c).w(10).h(10).roundedFull().circular();
-            if (online) _ = dot.bg(c.theme.success) else _ = dot.border(c.theme.muted).borderW(1.5);
-            dot.end();
+            s.dmAvatar(c, ch, name);
         } else ui.text(c, prefix, .{ .size = if (ch.kind == .channel) 17 else 13, .color = tone });
         icon.end();
         const weight: ui.Weight = if (ch.unread) .bold else if (is_sel) .semibold else .regular;
         ui.text(c, if (name.len == 0) ch.id else name, .{ .size = 15, .weight = weight, .color = tone, .truncate = .ellipsis });
+        if (s.store.isSelfDm(ch)) ui.text(c, "you", .{ .size = 13, .color = c.theme.muted });
         ui.spacer(c);
         if (ch.mentions > 0) {
-            const badge = ui.div(c).h(20).px(7).center().roundedFull().circular().bg(c.theme.accent);
+            const badge = ui.div(c).h(20).px(7).center().rounded(6).bg(c.theme.accent);
             ui.textf(c, .{ .size = 12, .weight = .bold, .color = c.theme.accent_text }, "{d}", .{ch.mentions});
             badge.end();
         } else if (ch.unread) ui.div(c).w(8).h(8).roundedFull().circular().bg(c.theme.accent).end();
+    }
+
+    /// The person's picture with a presence dot on its corner: filled when active, a ring when away
+    fn dmAvatar(s: *State, c: *ui.Context, ch: *const store.Channel, name: []const u8) void {
+        const holder = ui.div(c).w(nav_avatar).h(nav_avatar);
+        defer holder.end();
+        const uid = ch.user_id orelse "";
+        s.avatar(c, name, uid, nav_avatar, 12);
+        const online = if (uid.len > 0) s.store.isOnline(uid) else false;
+        var dot = ui.div(c).absolute().offset(nav_avatar - 11, nav_avatar - 11).w(11).h(11).roundedFull().circular().border(s.pal.container).borderW(2);
+        dot = dot.bg(if (online) c.theme.success else s.pal.container);
+        dot.end();
+        if (!online) ui.div(c).absolute().offset(nav_avatar - 9, nav_avatar - 9).w(7).h(7).roundedFull().circular().border(c.theme.muted).borderW(1.5).end();
     }
 
     fn main(s: *State, c: *ui.Context) void {
@@ -1365,9 +1518,7 @@ pub const State = struct {
 
         const author = if (m.user) |u| (s.store.userName(u) orelse u) else "unknown";
         if (head) {
-            const av = ui.div(c).w(avatar_size).h(avatar_size).roundedFull().circular().bg(theme.avatarColor(s.pal, m.user orelse author)).center();
-            ui.text(c, initialOf(c, author), .{ .size = 15, .weight = .semibold, .color = ui.Color.white });
-            av.end();
+            s.avatar(c, author, m.user orelse author, avatar_size, 15);
         } else {
             ui.div(c).w(avatar_size).h(1).end();
         }
@@ -1453,7 +1604,7 @@ pub const State = struct {
         for (m.reactions.items) |r| {
             var buf: [48]u8 = undefined;
             const label = if (slack.emoji.forReaction(&buf, r.name)) |glyph| c.print("{s} {d}", .{ glyph, r.count }) else c.print(":{s}: {d}", .{ r.name, r.count });
-            var pill = ui.div(c).row().itemsCenter().h(26).px(10).roundedFull().circular().control();
+            var pill = ui.div(c).row().itemsCenter().h(26).px(10).rounded(radius).control();
             pill = pill.bg(if (r.mine) s.pal.primary_container else s.pal.container_high);
             if (r.mine) pill = pill.border(s.pal.link).borderW(1);
             pill = pill.hover(if (r.mine) s.pal.primary_container else c.theme.surface_hover);
@@ -1498,7 +1649,7 @@ pub const State = struct {
         const bar_w = bar_btn * count + 2 * (count - 1) + 12;
         const x = @max(rect.x, rect.x + rect.w - bar_w - 16);
         const y = @max(4, rect.y - 16);
-        const bar = ui.div(c).row().fixed().offset(x, y).layer(20).w(bar_w).h(bar_btn + 4).itemsCenter().justifyCenter().gap(2).rounded(12).bg(s.pal.container_high).border(c.theme.border).borderW(1).shadow(.{ .color = c.theme.border.alpha(0.6), .blur = 8, .y = 2 });
+        const bar = ui.div(c).row().fixed().offset(x, y).layer(20).w(bar_w).h(bar_btn + 4).itemsCenter().justifyCenter().gap(2).rounded(10).bg(s.pal.container_high).border(c.theme.border).borderW(1).shadow(.{ .color = c.theme.border.alpha(0.6), .blur = 8, .y = 2 });
         defer bar.end();
         const target = message_menu.Target.make(channel_id, m.ts, in_thread);
         for (shown[0..n_shown]) |name| {
@@ -1693,7 +1844,7 @@ pub const State = struct {
             defer head.end();
             ui.text(c, "Thread", .{ .size = 18, .weight = .semibold });
             ui.spacer(c);
-            const close = ui.div(c).w(32).h(32).center().roundedFull().circular().control().hover(c.theme.surface_hover);
+            const close = ui.div(c).w(32).h(32).center().rounded(radius).control().hover(c.theme.surface_hover);
             defer close.end();
             if (close.clicked()) s.close_thread = true;
             ui.text(c, "✕", .{ .size = 14, .color = c.theme.muted });
@@ -1814,7 +1965,7 @@ pub const State = struct {
         const p = c.input.drag_over orelse return;
         const r = c.rects.get(c.node(index).id) orelse return;
         if (!r.contains(p)) return;
-        const veil = ui.div(c).fixed().offset(r.x + 8, r.y + 8).layer(30).w(r.w - 16).h(r.h - 16).center().rounded(16).bg(c.theme.accent.alpha(0.1)).border(c.theme.accent).borderW(2);
+        const veil = ui.div(c).fixed().offset(r.x + 8, r.y + 8).layer(30).w(r.w - 16).h(r.h - 16).center().rounded(12).bg(c.theme.accent.alpha(0.1)).border(c.theme.accent).borderW(2);
         defer veil.end();
         ui.text(c, "Drop to attach", .{ .size = 18, .weight = .semibold, .color = c.theme.accent });
     }
@@ -1823,7 +1974,7 @@ pub const State = struct {
     fn expandToggle(s: *State, c: *ui.Context, rect: ui.Rect) void {
         const w: f32 = 32;
         const h: f32 = 20;
-        const btn = ui.div(c).fixed().offset(rect.x + rect.w - w - 14, rect.y - h / 2).layer(20).w(w).h(h).center().roundedFull().circular().control().bg(s.pal.container_high).border(c.theme.border).borderW(1).hover(c.theme.surface_hover);
+        const btn = ui.div(c).fixed().offset(rect.x + rect.w - w - 14, rect.y - h / 2).layer(20).w(w).h(h).center().rounded(6).control().bg(s.pal.container_high).border(c.theme.border).borderW(1).hover(c.theme.surface_hover);
         defer btn.end();
         if (btn.clicked()) s.composer_expanded = !s.composer_expanded;
         ui.text(c, if (s.composer_expanded) "▾" else "▴", .{ .size = 12, .color = c.theme.muted });

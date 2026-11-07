@@ -68,3 +68,9 @@ family per window theme, fixed at window creation.
 - Test: in `texture_decode.zig` (skips without GTK 4 and a display).
 
 **Known limits:** decoded on the UI thread, like the PNG path; a GIF shows its first frame.
+
+## 7. A list in a popover or panel can drag its scrollbar thumb
+
+**Why:** `scroll.tryPressScrollbar` ignored a press on a scroll box's track whenever the node under the pointer was interactive, to let a control flush against the box's edge take its own click. A popover's panel is interactive and holds its list, so the list's thumb never dragged (Lax's font picker).
+
+**What:** `scroll.zig`: the press is only left to the node under the pointer when that node is not an ancestor of the scroll box (`isInside`): a control in the box, or an unrelated overlay, still wins; a panel that contains the box does not.

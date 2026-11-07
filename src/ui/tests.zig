@@ -1722,3 +1722,224 @@ test "files: an image shows under its name once its preview arrives, other files
     t.frame();
     try std.testing.expect(last_link_len > 0);
 }
+
+test "sidebar: search lists only matches, Esc and the clear button empty it" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..4) |_| t.frame();
+    try std.testing.expect(t.hasText("Find a conversation…"));
+    try std.testing.expect(t.hasText("dev") and t.hasText("Threads") and t.hasText("Direct messages"));
+
+    try t.clickText("Find a conversation…");
+    t.typeText("GEN");
+    for (0..3) |_| t.frame();
+    try t.screenshot("/tmp/lax-sidebar-search.png");
+    try std.testing.expect(t.hasText("general"));
+    try std.testing.expect(!t.hasText("dev") and !t.hasText("secret"));
+    // Rows with no match take their section header, and the top rows, with them
+    try std.testing.expect(t.hasText("Channels"));
+    try std.testing.expect(!t.hasText("Direct messages") and !t.hasText("Threads"));
+
+    t.typeText("zzz");
+    for (0..3) |_| t.frame();
+    try std.testing.expect(t.hasText("No conversations match"));
+    try std.testing.expect(!t.hasText("Channels"));
+
+    _ = t.shortcut(.{ .key = ui.Shortcut.escape });
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqual(@as(usize, 0), state.filter.text().len);
+    try std.testing.expect(t.hasText("dev") and t.hasText("Direct messages"));
+
+    // A DM is found by the person's name; the clear button empties the box
+    t.typeText("grace");
+    for (0..3) |_| t.frame();
+    try std.testing.expect(t.hasText("Direct messages") and !t.hasText("general"));
+    const x = t.findText("Grace").?;
+    _ = x;
+    state.filter.clear();
+    for (0..3) |_| t.frame();
+    try std.testing.expect(t.hasText("general"));
+}
+
+test "sidebar: spacing presets and the number set the row height" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 760, .scale = 1 });
+    defer t.deinit();
+    state.settings_open = true;
+    for (0..4) |_| t.frame();
+    try std.testing.expectEqual(@as(u16, settings_mod.row_comfortable), state.settings.sidebar_row);
+    try std.testing.expect(t.hasText("Compact") and t.hasText("Comfortable") and t.hasText("Cozy"));
+    // "dev" and "general" are neighbors
+    const gap = struct {
+        fn of(tt: *ui.Tester) f32 {
+            return tt.findText("general").?.y - tt.findText("dev").?.y;
+        }
+    };
+    try std.testing.expectApproxEqAbs(@as(f32, 40), gap.of(&t), 1);
+    try t.clickText("Compact");
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqual(@as(u16, settings_mod.row_compact), state.settings.sidebar_row);
+    try std.testing.expectApproxEqAbs(@as(f32, 32), gap.of(&t), 1);
+    try t.screenshot("/tmp/lax-sidebar-compact.png");
+    try t.clickText("Cozy");
+    for (0..3) |_| t.frame();
+    try std.testing.expectApproxEqAbs(@as(f32, 48), gap.of(&t), 1);
+    try t.screenshot("/tmp/lax-sidebar-cozy.png");
+    // Any value in range works (no preset is lit), and out of range is clamped
+    state.applySettings(.{ .sidebar_row = 44 });
+    for (0..3) |_| t.frame();
+    try std.testing.expectApproxEqAbs(@as(f32, 44), gap.of(&t), 1);
+    state.applySettings(.{ .sidebar_row = 500 });
+    try std.testing.expectEqual(@as(u16, settings_mod.row_max), state.settings.sidebar_row);
+}
+
+test "settings and themes are per workspace" {
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const dir = try std.fmt.allocPrint(arena_state.allocator(), ".zig-cache/tmp/{s}/lax", .{tmp.sub_path});
+
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    try st.apply(.{ .teams = .{ .list = &.{ .{ .id = "T1", .name = "Acme", .url = "u1" }, .{ .id = "T2", .name = "Side Project", .url = "u2" } }, .active = "T1" } });
+    try seedStore(&st);
+    var fake: Fake = .{};
+    var state = newFakeState(gpa, &st, &fake);
+    defer state.deinit();
+    state.preferred = "C1";
+    state.layout_dir = dir;
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 760, .scale = 1 });
+    defer t.deinit();
+    state.settings_open = true;
+    for (0..4) |_| t.frame();
+    try t.clickText("Ocean");
+    try t.clickText("Compact");
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqualStrings("ocean", state.settings.theme);
+
+    // The other workspace has not chosen anything
+    try t.clickText("S");
+    for (0..4) |_| t.frame();
+    try std.testing.expectEqualStrings("T2", st.active_team);
+    try std.testing.expectEqualStrings("", state.settings.theme);
+    try std.testing.expectEqual(@as(u16, settings_mod.row_comfortable), state.settings.sidebar_row);
+    try t.clickText("Forest");
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqualStrings("forest", state.settings.theme);
+
+    // Each is back as it was left, in this run and in the next
+    try t.clickText("A");
+    for (0..4) |_| t.frame();
+    try std.testing.expectEqualStrings("ocean", state.settings.theme);
+    try std.testing.expectEqual(@as(u16, settings_mod.row_compact), state.settings.sidebar_row);
+    const arena = arena_state.allocator();
+    try std.testing.expectEqualStrings("ocean", settings_mod.loadTeam(arena, std.testing.io, dir, "T1").theme);
+    try std.testing.expectEqualStrings("forest", settings_mod.loadTeam(arena, std.testing.io, dir, "T2").theme);
+    try t.clickText("S");
+    for (0..4) |_| t.frame();
+    try std.testing.expectEqualStrings("forest", state.settings.theme);
+}
+
+test "sidebar: DMs show the person's picture, asked for once, and the self row says you" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    try st.apply(.{ .users = &.{.{ .id = "U2", .name = "Grace", .image = "https://example.com/grace.png" }} });
+    try st.apply(.{ .channels = &.{.{ .id = "D2", .name = "", .kind = .im, .user_id = "U1" }} });
+    try st.apply(.{ .presence = .{ .users = &.{"U2"}, .active = true } });
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..4) |_| t.frame();
+    try std.testing.expectEqual(@as(usize, 1), fake.image_calls);
+    try std.testing.expect(t.hasText("you"));
+    try t.screenshot("/tmp/lax-sidebar-initials.png");
+
+    // 40 × 40 blue pixels
+    const px = try gpa.alloc(u8, 40 * 40 * 4);
+    defer gpa.free(px);
+    for (0..40 * 40) |i| @memcpy(px[i * 4 ..][0..4], &[4]u8{ 200, 100, 0, 255 });
+    const png = try ui.png.encode(gpa, .{ .bytes = px, .width = 40, .height = 40 });
+    defer gpa.free(png);
+    try st.apply(.{ .avatar = .{ .user = "U2", .bytes = png } });
+    for (0..3) |_| t.frame();
+    try std.testing.expect(st.userAvatar("U2") != null);
+    try std.testing.expect(st.userAvatar("U1") == null);
+    try t.screenshot("/tmp/lax-sidebar-avatar.png");
+    // Seen again in other conversations, it is not fetched again
+    state.pending_select = "C2";
+    for (0..4) |_| t.frame();
+    try std.testing.expectEqual(@as(usize, 1), fake.image_calls);
+}
+
+test "font picker: opens on the chosen font, and its scrollbar thumb drags" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 760, .scale = 1 });
+    defer t.deinit();
+    state.settings_open = true;
+    for (0..4) |_| t.frame();
+    // Open once to learn the fonts, then choose one far down
+    try t.clickText("Same as interface");
+    for (0..4) |_| t.frame();
+    const names = state.font_names orelse return error.SkipZigTest;
+    if (names.len < 40) return error.SkipZigTest;
+    const pick = names[names.len - 3];
+    const near = names[names.len - 4];
+    state.font_open[1] = false;
+    state.applySettings(.{ .chat_font = pick });
+    for (0..4) |_| t.frame();
+    try std.testing.expect(!state.font_open[1]);
+
+    // Open it again: the neighbor of the chosen font is on screen, not 1000 points below
+    const btn = t.findText(pick).?;
+    t.click(btn.x + 5, btn.y + 5);
+    for (0..4) |_| t.frame();
+    try std.testing.expect(state.font_open[1]);
+    const row = t.findText(near).?;
+    // (The list opens above the button when there is no room below)
+    try std.testing.expect(@abs(row.y - btn.y) < 340);
+    try t.screenshot("/tmp/lax-font-open.png");
+
+    // Grab the thumb and pull it up: the list scrolls back toward the top
+    const list_x = btn.x - 14 + 270;
+    t.moveTo(list_x, row.y);
+    for (0..3) |_| t.frame();
+    var it = t.ctx.scrollbars.iterator();
+    var geo: ?@TypeOf(t.ctx.scrollbars.get(0).?) = null;
+    while (it.next()) |e| if (geo == null or e.value_ptr.track_h < geo.?.track_h) {
+        geo = e.value_ptr.*;
+    };
+    const g = geo orelse return error.NoScrollbar;
+    const grab_y = g.thumb_y + g.thumb_h / 2;
+    t.drag(g.track_x + 5, grab_y, g.track_x + 5, grab_y - 120);
+    for (0..2) |_| t.frame();
+    try std.testing.expect(state.font_open[1]);
+    const moved = t.findText(near).?;
+    try std.testing.expect(moved.y - row.y > 300);
+    try t.screenshot("/tmp/lax-font-dragged.png");
+}
