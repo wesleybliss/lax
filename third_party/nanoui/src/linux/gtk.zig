@@ -178,6 +178,21 @@ pub const Api4 = struct {
     gdk_clipboard_set_text: *const fn (cb: *anyopaque, text: [*:0]const u8) callconv(.c) void,
     gdk_clipboard_read_text_async: *const fn (cb: *anyopaque, cancel: ?*anyopaque, done: AsyncFn, data: ?*anyopaque) callconv(.c) void,
     gdk_clipboard_read_text_finish: *const fn (cb: *anyopaque, result: *anyopaque, err: ?*anyopaque) callconv(.c) ?[*:0]u8,
+    gtk_drop_target_new: *const fn (kind: usize, actions: c_uint) callconv(.c) *anyopaque,
+    gtk_drop_target_set_gtypes: *const fn (target: *anyopaque, types: [*]const usize, n: usize) callconv(.c) void,
+    gdk_file_list_get_type: *const fn () callconv(.c) usize,
+    gdk_file_list_get_files: *const fn (list: *anyopaque) callconv(.c) ?*SList,
+    g_file_get_uri: *const fn (file: *anyopaque) callconv(.c) ?[*:0]u8,
+    g_type_check_value_holds: *const fn (value: *const anyopaque, kind: usize) callconv(.c) c_int,
+    g_value_get_boxed: *const fn (value: *const anyopaque) callconv(.c) ?*anyopaque,
+    g_value_get_string: *const fn (value: *const anyopaque) callconv(.c) ?[*:0]const u8,
+    g_bytes_new: *const fn (data: [*]const u8, len: usize) callconv(.c) *anyopaque,
+    g_bytes_unref: *const fn (bytes: *anyopaque) callconv(.c) void,
+    g_error_free: *const fn (err: *anyopaque) callconv(.c) void,
+    gdk_texture_new_from_bytes: *const fn (bytes: *anyopaque, err: *?*anyopaque) callconv(.c) ?*anyopaque,
+    gdk_texture_get_width: *const fn (texture: *anyopaque) callconv(.c) c_int,
+    gdk_texture_get_height: *const fn (texture: *anyopaque) callconv(.c) c_int,
+    gdk_texture_download: *const fn (texture: *anyopaque, data: [*]u8, stride: usize) callconv(.c) void,
 };
 
 pub const DrawFn = *const fn (area: *Widget, cr: *anyopaque, width: c_int, height: c_int, data: ?*anyopaque) callconv(.c) void;

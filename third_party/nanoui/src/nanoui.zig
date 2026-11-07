@@ -190,6 +190,7 @@ test {
             _ = @import("windows/tests_ime.zig");
         }
         // The GTK window's: decorations, the taskbar hint, opacity.
+        if (builtin.os.tag == .linux) _ = @import("linux/texture_decode.zig");
         if (builtin.os.tag == .linux) _ = @import("linux/tests_window.zig");
         // A page in WebKitGTK, end to end, where one is installed.
         if (builtin.os.tag == .linux) _ = @import("linux/tests_page.zig");

@@ -58,6 +58,16 @@ fn actionOpen(ctx: *anyopaque, channel: []const u8) void {
     net.open(channel);
 }
 
+fn actionUpload(ctx: *anyopaque, channel: []const u8, text: []const u8, thread_ts: ?[]const u8, paths: []const []const u8) void {
+    const net: *Net = @ptrCast(@alignCast(ctx));
+    net.upload(channel, text, thread_ts, paths);
+}
+
+fn actionFetchImage(ctx: *anyopaque, id: []const u8, url: []const u8) void {
+    const net: *Net = @ptrCast(@alignCast(ctx));
+    net.fetchImage(id, url);
+}
+
 fn actionSend(ctx: *anyopaque, channel: []const u8, text: []const u8, thread_ts: ?[]const u8) void {
     const net: *Net = @ptrCast(@alignCast(ctx));
     net.send(channel, text, thread_ts);
@@ -129,6 +139,8 @@ pub fn main(init: std.process.Init) !void {
         .ctx = &net,
         .open = actionOpen,
         .send = actionSend,
+        .upload = actionUpload,
+        .fetch_image = actionFetchImage,
         .older = actionOlder,
         .open_thread = actionOpenThread,
         .react = actionReact,

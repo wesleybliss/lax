@@ -7,6 +7,7 @@
 const std = @import("std");
 const gtk = @import("gtk.zig");
 const surface = @import("surface.zig");
+const types = @import("../ui/types.zig");
 const Surface = surface.Surface;
 
 /// Draws `s` in its window and feeds it GTK 4's input.
@@ -48,8 +49,80 @@ pub fn attachArea(s: *Surface) void {
     gtk.connect(focus, "enter", @ptrCast(&onFocusIn), s);
     gtk.connect(focus, "leave", @ptrCast(&onFocusOut), s);
     g4.gtk_widget_add_controller(area, focus);
+    attachDrops(s, area);
     g4.gtk_im_context_set_client_widget(s.im, area);
     g4.gtk_window_set_child(s.window.gtkwindow.?, area);
+}
+
+/// Files, links and text dragged in from another app. As on the Mac and
+/// Windows, a box opts in with `acceptDrop`: elsewhere the drag is refused
+/// and no frame runs for it.
+fn attachDrops(s: *Surface, area: *gtk.Widget) void {
+    const g4 = &gtk.v4api;
+    const copy = 1; // GDK_ACTION_COPY
+    const target = g4.gtk_drop_target_new(0, copy);
+    const kinds = [_]usize{ g4.gdk_file_list_get_type(), 64 }; // GdkFileList, G_TYPE_STRING
+    g4.gtk_drop_target_set_gtypes(target, &kinds, kinds.len);
+    gtk.connect(target, "enter", @ptrCast(&onDragOver), s);
+    gtk.connect(target, "motion", @ptrCast(&onDragOver), s);
+    gtk.connect(target, "leave", @ptrCast(&onDragLeave), s);
+    gtk.connect(target, "drop", @ptrCast(&onDrop), s);
+    g4.gtk_widget_add_controller(area, target);
+}
+
+fn onDragOver(_: *anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) c_uint {
+    const s = of(data);
+    const p: types.Point = .{ .x = @floatCast(x), .y = @floatCast(y) };
+    s.ctx.input.drag_over = p;
+    s.frame();
+    return if (s.ctx.acceptsDropAt(p)) 1 else 0;
+}
+
+fn onDragLeave(_: *anyopaque, data: ?*anyopaque) callconv(.c) void {
+    const s = of(data);
+    s.ctx.input.drag_over = null;
+    s.frame();
+}
+
+/// The drop's files (as file URLs, like the other platforms') or its text,
+/// for one frame.
+fn onDrop(_: *anyopaque, value: *const anyopaque, x: f64, y: f64, data: ?*anyopaque) callconv(.c) c_int {
+    const s = of(data);
+    const g4 = &gtk.v4api;
+    const p: types.Point = .{ .x = @floatCast(x), .y = @floatCast(y) };
+    s.ctx.input.drag_over = null;
+    if (!s.ctx.acceptsDropAt(p)) {
+        s.frame();
+        return 0;
+    }
+    var arena: std.heap.ArenaAllocator = .init(s.gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var urls: std.ArrayList([]const u8) = .empty;
+    var text: []const u8 = "";
+    if (g4.g_type_check_value_holds(value, g4.gdk_file_list_get_type()) != 0) {
+        if (g4.g_value_get_boxed(value)) |list| {
+            const files = g4.gdk_file_list_get_files(list);
+            defer gtk.api.g_slist_free(files);
+            var node = files;
+            while (node) |n| : (node = n.next) {
+                const file = n.data orelse continue;
+                const uri = g4.g_file_get_uri(file) orelse continue;
+                defer gtk.api.g_free(uri);
+                urls.append(a, a.dupe(u8, std.mem.span(uri)) catch continue) catch {};
+            }
+        }
+    } else if (g4.g_value_get_string(value)) |str| {
+        text = a.dupe(u8, std.mem.span(str)) catch "";
+    }
+    if (urls.items.len == 0 and text.len == 0) {
+        s.frame();
+        return 0;
+    }
+    s.ctx.input.drop = .{ .point = p, .urls = urls.items, .text = text };
+    s.frame();
+    s.ctx.input.drop = null;
+    return 1;
 }
 
 fn onRealize(_: *gtk.Widget, data: ?*anyopaque) callconv(.c) void {

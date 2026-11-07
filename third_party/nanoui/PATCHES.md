@@ -46,3 +46,25 @@ family per window theme, fixed at window creation.
 - `linux/desktop.zig`: `isDark()` asks GTK's settings: `gtk-interface-color-scheme` (GTK 4.20+, the settings portal's light or dark choice), then `gtk-application-prefer-dark-theme`, then a theme name containing "dark". `GTK_THEME`, when set, still decides alone.
 - `linux/gtk.zig`: `g_object_get`, `gtk_settings_get_default`, `gtk_get_minor_version` (GTK 4).
 - `linux/surface.zig`: `watchAppearance` connects to the settings' `notify::` signals for those properties and requests a frame; the handlers are disconnected in `destroy`. Not connected with a `theme_override`.
+
+## 5. Files, links and text dragged in from other apps (Linux, GTK 4)
+
+**Why:** `Context.acceptDrop` / `dropAt` already worked on the Mac and Windows, but the Linux surface had no drop target, so a drag from the file manager was refused.
+
+**What:**
+- `linux/surface_gtk4.zig`: `attachDrops` puts a `GtkDropTarget` (copy; `GdkFileList` and strings) on the area. `enter` / `motion` set `input.drag_over`, run a frame and answer copy only where `acceptsDropAt`; `leave` clears it; `drop` delivers files as `file://` URLs (`g_file_get_uri`, like the other platforms) or the text for one frame. It is attached with the other controllers, so the GL to CPU fallback keeps it.
+- `linux/gtk.zig`: the GTK 4 table gains `gtk_drop_target_new`, `gtk_drop_target_set_gtypes`, `gdk_file_list_get_type` / `_get_files` (GTK 4.6+, else the old GTK 3 fallback), `g_file_get_uri`, `g_type_check_value_holds`, `g_value_get_boxed`, `g_value_get_string`.
+
+**Known limits:** GTK 3 has no drop target (GTK 4 is what ships on current distros); no tests (a drop needs a real drag source on a display).
+
+## 6. JPEG, GIF, WebP and the rest on Linux, through GTK 4
+
+**Why:** the portable image path only reads PNG, so a JPEG given to `ui.image` was dropped. Slack's file previews are JPEGs for JPEG uploads.
+
+**What:**
+- `linux/texture_decode.zig` (new): `decode` and `dimensions` over `gdk_texture_new_from_bytes` and `gdk_texture_download` (premultiplied BGRA, what the PNG decoder returns). GTK 3 has no texture: it answers "invalid image", as before.
+- `linux/gtk.zig`: the GTK 4 table gains `g_bytes_new`, `g_bytes_unref`, `g_error_free`, `gdk_texture_new_from_bytes`, `_get_width`, `_get_height`, `gdk_texture_download`.
+- `ui/images.zig`: on Linux, bytes that are not a PNG go to it, for the header probe and for the decode. PNG keeps nanoui's own decoder.
+- Test: in `texture_decode.zig` (skips without GTK 4 and a display).
+
+**Known limits:** decoded on the UI thread, like the PNG path; a GIF shows its first frame.

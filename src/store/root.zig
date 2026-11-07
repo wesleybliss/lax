@@ -116,6 +116,19 @@ pub const ReactionInfo = struct {
     mine: bool = false,
 };
 
+/// A file attached to a message
+pub const FileInfo = struct {
+    id: []const u8,
+    name: []const u8,
+    mimetype: []const u8 = "",
+    /// Opens it in the browser
+    link: []const u8 = "",
+    /// An image's preview picture (empty: none yet, or not an image) and its size
+    thumb: []const u8 = "",
+    thumb_w: u32 = 0,
+    thumb_h: u32 = 0,
+};
+
 pub const MessageInfo = struct {
     ts: []const u8,
     user: ?[]const u8,
@@ -126,6 +139,7 @@ pub const MessageInfo = struct {
     reactions: []const ReactionInfo = &.{},
     /// Replies, for a thread parent
     reply_count: u32 = 0,
+    files: []const FileInfo = &.{},
 };
 
 pub const Connection = enum { connecting, online, offline };
@@ -163,7 +177,10 @@ pub const Update = union(enum) {
     presence: struct { users: []const []const u8, active: bool },
     /// A new message (live event or our own send)
     message: struct { channel: []const u8, message: MessageInfo },
-    edited: struct { channel: []const u8, ts: []const u8, text: []const u8 },
+    /// `files`: what the edit says is attached (a file's preview arrives this way); empty keeps what is shown
+    edited: struct { channel: []const u8, ts: []const u8, text: []const u8, files: []const FileInfo = &.{} },
+    /// A file's preview picture, encoded (PNG, JPEG, ...)
+    file_image: struct { id: []const u8, bytes: []const u8 },
     deleted: struct { channel: []const u8, ts: []const u8 },
     /// Read up to `ts` on another client (or this one); counts when Slack says
     marked: struct { channel: []const u8, ts: []const u8, unread: ?u32 = null, mentions: ?u32 = null },
@@ -220,6 +237,7 @@ pub const Message = struct {
     subtype: ?[]u8,
     reactions: std.ArrayList(Reaction) = .empty,
     reply_count: u32 = 0,
+    files: []FileInfo = &.{},
 };
 
 pub const Typing = struct { user: []u8, at_ms: i64 };
@@ -321,6 +339,8 @@ pub const Store = struct {
     from_cache: bool = false,
     /// Other workspaces' data, by team id
     parked: std.StringHashMapUnmanaged(Space) = .empty,
+    /// Files' preview pictures by file id (ids are unique across workspaces)
+    images: std.StringHashMapUnmanaged([]u8) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) Store {
         return .{ .gpa = gpa, .self_id = &.{}, .team_name = &.{}, .status = &.{}, .active_team = &.{} };
@@ -339,6 +359,7 @@ pub const Store = struct {
             s.gpa.free(kv.key_ptr.*);
         }
         s.parked.deinit(s.gpa);
+        s.clearImages();
     }
 
     fn clearTeams(s: *Store) void {
@@ -495,6 +516,52 @@ pub const Store = struct {
         s.gpa.free(m.text);
         if (m.thread_ts) |t| s.gpa.free(t);
         if (m.subtype) |t| s.gpa.free(t);
+        s.freeFiles(m.files);
+    }
+
+    fn freeFiles(s: *Store, files: []FileInfo) void {
+        for (files) |f| for ([_][]const u8{ f.id, f.name, f.mimetype, f.link, f.thumb }) |str| if (str.len > 0) s.gpa.free(str);
+        s.gpa.free(files);
+    }
+
+    /// Copies of `infos` the store owns (empty strings stay unallocated)
+    fn dupeFiles(s: *Store, infos: []const FileInfo) std.mem.Allocator.Error![]FileInfo {
+        if (infos.len == 0) return &.{};
+        const out = try s.gpa.alloc(FileInfo, infos.len);
+        var made: usize = 0;
+        errdefer s.freeFiles(out[0..made]);
+        for (infos) |f| {
+            out[made] = .{ .id = "", .name = "", .thumb_w = f.thumb_w, .thumb_h = f.thumb_h };
+            made += 1;
+            const dst = &out[made - 1];
+            inline for (.{ "id", "name", "mimetype", "link", "thumb" }) |field| {
+                const src = @field(f, field);
+                if (src.len > 0) @field(dst, field) = try s.gpa.dupe(u8, src);
+            }
+        }
+        return out;
+    }
+
+    /// Files `info` has and the held copy of the message lacks; whether it took them
+    fn adoptFiles(s: *Store, m: *Message, info: MessageInfo) std.mem.Allocator.Error!bool {
+        if (m.files.len > 0 or info.files.len == 0) return false;
+        m.files = try s.dupeFiles(info.files);
+        return true;
+    }
+
+    /// Forgets every preview picture (the conversation changed)
+    pub fn clearImages(s: *Store) void {
+        var it = s.images.iterator();
+        while (it.next()) |kv| {
+            s.gpa.free(kv.key_ptr.*);
+            s.gpa.free(kv.value_ptr.*);
+        }
+        s.images.clearAndFree(s.gpa);
+    }
+
+    /// A file's preview picture, if it has arrived
+    pub fn fileImage(s: *const Store, id: []const u8) ?[]const u8 {
+        return s.images.get(id);
     }
 
     fn freeChannel(s: *Store, c: *Channel) void {
@@ -644,7 +711,27 @@ pub const Store = struct {
                 const c = s.channel(e.channel) orelse return;
                 const i = findTs(c.messages.items, e.ts) orelse return;
                 try s.replace(&c.messages.items[i].text, e.text);
+                if (e.files.len > 0) {
+                    const files = try s.dupeFiles(e.files);
+                    s.freeFiles(c.messages.items[i].files);
+                    c.messages.items[i].files = files;
+                }
                 c.rev +%= 1;
+            },
+            .file_image => |f| {
+                // Keyed by file id: the same file in two places is one picture
+                const bytes = try s.gpa.dupe(u8, f.bytes);
+                errdefer s.gpa.free(bytes);
+                const gop = try s.images.getOrPut(s.gpa, f.id);
+                if (gop.found_existing) {
+                    s.gpa.free(gop.value_ptr.*);
+                } else {
+                    gop.key_ptr.* = s.gpa.dupe(u8, f.id) catch |e| {
+                        _ = s.images.remove(f.id);
+                        return e;
+                    };
+                }
+                gop.value_ptr.* = bytes;
             },
             .deleted => |d| {
                 const c = s.channel(d.channel) orelse return;
@@ -800,6 +887,7 @@ pub const Store = struct {
         m.text = try s.gpa.dupe(u8, info.text);
         if (info.thread_ts) |t| m.thread_ts = try s.gpa.dupe(u8, t);
         if (info.subtype) |t| m.subtype = try s.gpa.dupe(u8, t);
+        m.files = try s.dupeFiles(info.files);
         for (info.reactions) |r| {
             const name = try s.gpa.dupe(u8, r.name);
             errdefer s.gpa.free(name);
@@ -818,7 +906,10 @@ pub const Store = struct {
             const mid = (lo + hi) / 2;
             if (tsLess(items[mid].ts, info.ts)) lo = mid + 1 else hi = mid;
         }
-        if (lo < items.len and std.mem.eql(u8, items[lo].ts, info.ts)) return;
+        if (lo < items.len and std.mem.eql(u8, items[lo].ts, info.ts)) {
+            _ = try s.adoptFiles(&items[lo], info);
+            return;
+        }
         var m = try s.makeMessage(info);
         errdefer s.freeMessage(&m);
         try list.insert(s.gpa, lo, m);
@@ -899,7 +990,11 @@ pub const Store = struct {
             const mid = (lo + hi) / 2;
             if (tsLess(items[mid].ts, info.ts)) lo = mid + 1 else hi = mid;
         }
-        if (lo < items.len and std.mem.eql(u8, items[lo].ts, info.ts)) return;
+        if (lo < items.len and std.mem.eql(u8, items[lo].ts, info.ts)) {
+            // Seen already (the disk cache keeps no files): Slack's copy may know more
+            if (try s.adoptFiles(&items[lo], info)) c.rev +%= 1;
+            return;
+        }
 
         var m = try s.makeMessage(info);
         errdefer s.freeMessage(&m);
@@ -1125,4 +1220,26 @@ test "sidebar preference decides which conversations are listed" {
     try std.testing.expect(s.shownInSidebar(s.channel("D1").?));
     try std.testing.expectEqual(SidebarMode.active, SidebarMode.parse("hide_inactive_channels"));
     try std.testing.expectEqual(SidebarMode.all, SidebarMode.parse(""));
+}
+
+test "a refetched message gains the files the cached copy lacked, and previews can be cleared" {
+    const gpa = std.testing.allocator;
+    var s = Store.init(gpa);
+    defer s.deinit();
+    try s.apply(.{ .channels = &.{.{ .id = "C1", .name = "general", .kind = .channel }} });
+    const ts = "1700000001.000100";
+    try s.apply(.{ .history = .{ .channel = "C1", .messages = &.{.{ .ts = ts, .user = null, .text = "pic" }}, .has_more = false } });
+    const c = s.channel("C1").?;
+    try std.testing.expectEqual(@as(usize, 0), c.messages.items[0].files.len);
+    const rev = c.rev;
+    const files = [_]FileInfo{.{ .id = "F1", .name = "a.png", .thumb = "https://files.slack.com/a.png", .thumb_w = 10, .thumb_h = 10 }};
+    try s.apply(.{ .history = .{ .channel = "C1", .messages = &.{.{ .ts = ts, .user = null, .text = "pic", .files = &files }}, .has_more = false } });
+    try std.testing.expectEqual(@as(usize, 1), c.messages.items[0].files.len);
+    try std.testing.expectEqualStrings("a.png", c.messages.items[0].files[0].name);
+    try std.testing.expect(c.rev != rev);
+
+    try s.apply(.{ .file_image = .{ .id = "F1", .bytes = "png" } });
+    try std.testing.expectEqualStrings("png", s.fileImage("F1").?);
+    s.clearImages();
+    try std.testing.expect(s.fileImage("F1") == null);
 }

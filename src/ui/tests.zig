@@ -213,6 +213,13 @@ const Fake = struct {
     sent_text: [256]u8 = undefined,
     sent_len: usize = 0,
     sent_thread: bool = false,
+    upload_text: [64]u8 = undefined,
+    upload_text_len: usize = 0,
+    upload_thread: bool = false,
+    upload_files: usize = 0,
+    image_calls: usize = 0,
+    upload_first: [128]u8 = undefined,
+    upload_first_len: usize = 0,
     react_name: [32]u8 = undefined,
     react_len: usize = 0,
     react_add: bool = false,
@@ -228,6 +235,8 @@ const Fake = struct {
             .ctx = f,
             .open = open,
             .send = send,
+            .upload = upload,
+            .fetch_image = fetchImage,
             .older = older,
             .open_thread = openThread,
             .react = react,
@@ -260,6 +269,21 @@ const Fake = struct {
         @memcpy(f.sent_text[0..text.len], text);
         f.sent_len = text.len;
         f.sent_thread = thread_ts != null;
+    }
+    fn upload(ctx: *anyopaque, _: []const u8, text: []const u8, thread_ts: ?[]const u8, paths: []const []const u8) void {
+        const f: *Fake = @ptrCast(@alignCast(ctx));
+        @memcpy(f.upload_text[0..text.len], text);
+        f.upload_text_len = text.len;
+        f.upload_thread = thread_ts != null;
+        f.upload_files = paths.len;
+        if (paths.len > 0) {
+            @memcpy(f.upload_first[0..paths[0].len], paths[0]);
+            f.upload_first_len = paths[0].len;
+        }
+    }
+    fn fetchImage(ctx: *anyopaque, _: []const u8, _: []const u8) void {
+        const f: *Fake = @ptrCast(@alignCast(ctx));
+        f.image_calls += 1;
     }
     fn older(ctx: *anyopaque, _: []const u8, _: []const u8) void {
         const f: *Fake = @ptrCast(@alignCast(ctx));
@@ -1293,4 +1317,99 @@ test "sidebar: a DM without a resolved name stays out until it resolves" {
     try st.apply(.{ .users = &.{.{ .id = "U9", .name = "Newly Named" }} });
     t.frame();
     try std.testing.expect(t.hasText("Newly Named"));
+}
+
+test "drops: files dropped on the conversation wait as chips and go with the next message" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    try seedStore(&st);
+    var fake: Fake = .{};
+    var state = app_view.State.init(gpa, std.testing.io, &st, fake.actions());
+    defer state.deinit();
+    state.preferred = "C1";
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..4) |_| t.frame();
+
+    // Over the sidebar nothing takes a drop; over the conversation it does
+    t.drop(100, 300, &.{"file:///tmp/nope.png"}, "");
+    t.frame();
+    try std.testing.expect(state.main_attach.isEmpty());
+    t.drop(600, 300, &.{ "file:///tmp/My%20Photo.png", "https://example.com/x.png", "file:///tmp/notes.txt" }, "");
+    t.frame();
+    try std.testing.expectEqual(@as(usize, 2), state.main_attach.paths().len);
+    try std.testing.expect(t.hasText("My Photo.png"));
+    try std.testing.expect(t.hasText("notes.txt"));
+    try t.screenshot("/tmp/lax-app-attachments.png");
+
+    // Enter with an empty box sends just the files
+    try t.clickText("Message #general");
+    t.key(.enter);
+    t.frame();
+    try std.testing.expectEqual(@as(usize, 2), fake.upload_files);
+    try std.testing.expectEqualStrings("/tmp/My Photo.png", fake.upload_first[0..fake.upload_first_len]);
+    try std.testing.expectEqual(@as(usize, 0), fake.sent_len);
+    try std.testing.expect(state.main_attach.isEmpty());
+
+    // With text, it is the files' comment
+    t.drop(600, 300, &.{"file:///tmp/a.zig"}, "");
+    t.frame();
+    try t.clickText("Message #general");
+    t.typeText("look at this");
+    t.key(.enter);
+    t.frame();
+    try std.testing.expectEqual(@as(usize, 1), fake.upload_files);
+    try std.testing.expectEqualStrings("look at this", fake.upload_text[0..fake.upload_text_len]);
+    try std.testing.expect(!fake.upload_thread);
+}
+
+test "files: an image shows under its name once its preview arrives, other files are chips" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    try seedStore(&st);
+    try st.apply(.{ .message = .{ .channel = "C1", .message = .{
+        .ts = "1700000300.000100",
+        .user = "U2",
+        .text = "testing files",
+        .files = &.{
+            .{ .id = "F1", .name = "lounge.png", .mimetype = "image/png", .link = "https://acme.slack.com/files/F1", .thumb = "https://files.slack.com/t.png", .thumb_w = 120, .thumb_h = 80 },
+            .{ .id = "F2", .name = "report.pdf", .mimetype = "application/pdf", .link = "https://acme.slack.com/files/F2" },
+        },
+    } } });
+    var fake: Fake = .{};
+    var state = app_view.State.init(gpa, std.testing.io, &st, fake.actions());
+    defer state.deinit();
+    state.preferred = "C1";
+    state.opener = fakeOpener;
+    last_link_len = 0;
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..4) |_| t.frame();
+
+    try std.testing.expect(t.hasText("lounge.png"));
+    try std.testing.expect(t.hasText("report.pdf"));
+    // The preview is asked for once, however many frames draw it
+    t.frame();
+    try std.testing.expectEqual(@as(usize, 1), fake.image_calls);
+
+    // 120 × 80 red pixels
+    const px = try gpa.alloc(u8, 120 * 80 * 4);
+    defer gpa.free(px);
+    for (0..120 * 80) |i| @memcpy(px[i * 4 ..][0..4], &[4]u8{ 0, 0, 255, 255 });
+    const png = try ui.png.encode(gpa, .{ .bytes = px, .width = 120, .height = 80 });
+    defer gpa.free(png);
+    try st.apply(.{ .file_image = .{ .id = "F1", .bytes = png } });
+    t.frame();
+    t.frame();
+    try t.screenshot("/tmp/lax-app-files.png");
+    try std.testing.expect(st.fileImage("F1") != null);
+
+    // Clicking the chip opens the file in the browser
+    try t.clickText("report.pdf");
+    t.frame();
+    try std.testing.expect(last_link_len > 0);
 }

@@ -12,6 +12,11 @@ const json = slack.jsonutil;
 pub const Command = union(enum) {
     /// Post a message, in a thread if `thread_ts` is set (owned strings)
     send: struct { channel: []u8, text: []u8, thread_ts: ?[]u8 },
+    /// Post files (paths) with `text` as their comment, in a thread if
+    /// `thread_ts` is set (owned strings)
+    upload: struct { channel: []u8, text: []u8, thread_ts: ?[]u8, paths: [][]u8 },
+    /// Download a file's preview picture (`url` is private to the workspace)
+    fetch_image: struct { id: []u8, url: []u8 },
     /// Load the page of messages before `before`
     older: struct { channel: []u8, before: []u8 },
     open_thread: struct { channel: []u8, ts: []u8 },
@@ -38,6 +43,17 @@ pub const Command = union(enum) {
                 gpa.free(m.channel);
                 gpa.free(m.text);
                 if (m.thread_ts) |t| gpa.free(t);
+            },
+            .upload => |m| {
+                gpa.free(m.channel);
+                gpa.free(m.text);
+                if (m.thread_ts) |t| gpa.free(t);
+                for (m.paths) |p| gpa.free(p);
+                gpa.free(m.paths);
+            },
+            .fetch_image => |m| {
+                gpa.free(m.id);
+                gpa.free(m.url);
             },
             .older => |m| {
                 gpa.free(m.channel);
@@ -71,6 +87,9 @@ pub const Command = union(enum) {
         }
     }
 };
+
+/// Largest file read into memory to upload (one buffer: the file and its form)
+const upload_max = 256 << 20;
 
 /// Offline for longer than this: fetch conversations and users again
 const full_refresh_ms = 5 * 60 * 1000;
@@ -180,6 +199,35 @@ pub const Net = struct {
         const tx = n.gpa.dupe(u8, text) catch return;
         const th = if (thread_ts) |t| n.gpa.dupe(u8, t) catch return else null;
         n.commands.push(n.gpa, n.io, .{ .send = .{ .channel = ch, .text = tx, .thread_ts = th } }) catch {};
+    }
+
+    pub fn upload(n: *Net, channel: []const u8, text: []const u8, thread_ts: ?[]const u8, paths: []const []const u8) void {
+        const ch = n.gpa.dupe(u8, channel) catch return;
+        const tx = n.gpa.dupe(u8, text) catch return;
+        const th = if (thread_ts) |t| n.gpa.dupe(u8, t) catch return else null;
+        const owned = n.gpa.alloc([]u8, paths.len) catch return;
+        var made: usize = 0;
+        for (paths) |p| {
+            owned[made] = n.gpa.dupe(u8, p) catch break;
+            made += 1;
+        }
+        if (made == 0) {
+            n.gpa.free(owned);
+            return;
+        }
+        n.commands.push(n.gpa, n.io, .{ .upload = .{ .channel = ch, .text = tx, .thread_ts = th, .paths = owned[0..made] } }) catch {};
+    }
+
+    pub fn fetchImage(n: *Net, id: []const u8, url: []const u8) void {
+        const i = n.gpa.dupe(u8, id) catch return;
+        const u = n.gpa.dupe(u8, url) catch {
+            n.gpa.free(i);
+            return;
+        };
+        n.commands.push(n.gpa, n.io, .{ .fetch_image = .{ .id = i, .url = u } }) catch {
+            n.gpa.free(i);
+            n.gpa.free(u);
+        };
     }
 
     pub fn older(n: *Net, channel: []const u8, before: []const u8) void {
@@ -947,6 +995,102 @@ pub const Net = struct {
         if (built) |u| n.emit(.{ .arena = item_arena, .update = u }) else item_arena.deinit();
     }
 
+    /// Slack's upload flow, as the web client does it: an upload URL for each
+    /// file (`files.getUploadURL`), its bytes posted there, then one
+    /// `files.completeUpload` that posts the message. The socket delivers it.
+    fn uploadFiles(n: *Net, api: *slack.http.Api, channel: []const u8, text: []const u8, thread_ts: ?[]const u8, paths: []const []const u8) SessionError!void {
+        var tmp = std.heap.ArenaAllocator.init(n.gpa);
+        defer tmp.deinit();
+        const ta = tmp.allocator();
+        const Item = struct { id: []const u8, title: []const u8 };
+        var done: std.ArrayList(Item) = .empty;
+        for (paths) |path| {
+            const name = std.fs.path.basename(path);
+            n.emitStatus("Uploading {s}…", .{name});
+            const id = n.uploadOne(api, ta, path, name) catch |err| switch (err) {
+                error.AuthFailed => return error.AuthFailed,
+                error.OutOfMemory => return error.OutOfMemory,
+                else => {
+                    n.emitStatus("Could not upload {s}: {s}", .{ name, uploadProblem(api, err) });
+                    continue;
+                },
+            };
+            try done.append(ta, .{ .id = id, .title = name });
+        }
+        if (done.items.len == 0) return;
+        var files: std.Io.Writer.Allocating = .init(ta);
+        std.json.Stringify.value(done.items, .{}, &files.writer) catch return error.OutOfMemory;
+        var params: std.ArrayList(slack.http.Param) = .empty;
+        try params.appendSlice(ta, &.{ .{ "files", files.written() }, .{ "channel", channel } });
+        if (text.len > 0) try params.append(ta, .{ "intro", text });
+        if (thread_ts) |t| try params.append(ta, .{ "thread_ts", t });
+        _ = api.call(ta, "files.completeUpload", params.items) catch |err| {
+            if (err == error.SlackError) {
+                if (api.diag.isAuthError()) return error.AuthFailed;
+                n.emitStatus("Upload failed: {s}", .{api.diag.slackError()});
+            } else n.emitStatus("Upload failed: {s}", .{@errorName(err)});
+            return;
+        };
+        n.emitStatus("", .{});
+    }
+
+    const UploadError = error{ Unreadable, NotAFile, TooLarge, AuthFailed, NoUploadUrl } || slack.http.Error;
+
+    /// One file's bytes to Slack; its file id.
+    fn uploadOne(n: *Net, api: *slack.http.Api, ta: std.mem.Allocator, path: []const u8, name: []const u8) UploadError![]const u8 {
+        // The bytes only live while this file uploads
+        var fa = std.heap.ArenaAllocator.init(n.gpa);
+        defer fa.deinit();
+        const a = fa.allocator();
+        const file = std.Io.Dir.cwd().openFile(n.io, path, .{}) catch return error.Unreadable;
+        defer file.close(n.io);
+        const stat = file.stat(n.io) catch return error.Unreadable;
+        if (stat.kind != .file) return error.NotAFile;
+        if (stat.size > upload_max) return error.TooLarge;
+        const size: usize = @intCast(stat.size);
+        // head ++ bytes ++ tail, read straight into place
+        const parts = try slack.http.multipartParts(a, name);
+        const body = try a.alloc(u8, parts.head.len + size + parts.tail.len);
+        @memcpy(body[0..parts.head.len], parts.head);
+        const got = file.readPositionalAll(n.io, body[parts.head.len..][0..size], 0) catch return error.Unreadable;
+        if (got != size) return error.Unreadable;
+        @memcpy(body[parts.head.len + size ..], parts.tail);
+
+        const length = try std.fmt.allocPrint(a, "{d}", .{size});
+        const res = api.call(a, "files.getUploadURL", &.{ .{ "filename", name }, .{ "length", length } }) catch |err| {
+            if (err == error.SlackError and api.diag.isAuthError()) return error.AuthFailed;
+            return err;
+        };
+        const id = json.str(res.object, "file") orelse return error.NoUploadUrl;
+        const url = json.str(res.object, "upload_url") orelse return error.NoUploadUrl;
+        try api.upload(a, url, body);
+        return ta.dupe(u8, id);
+    }
+
+    fn uploadProblem(api: *const slack.http.Api, err: UploadError) []const u8 {
+        return switch (err) {
+            error.Unreadable => "could not read it",
+            error.NotAFile => "not a file",
+            error.TooLarge => "too large",
+            error.SlackError => api.diag.slackError(),
+            else => @errorName(err),
+        };
+    }
+
+    /// A file's preview, for the message that shows it
+    fn fetchFileImage(n: *Net, api: *slack.http.Api, id: []const u8, url: []const u8) void {
+        n.dbg("fetching file preview {s}", .{id});
+        var item_arena = std.heap.ArenaAllocator.init(n.gpa);
+        const ia = item_arena.allocator();
+        const bytes = api.downloadPrivate(ia, url, 8 << 20) catch |err| {
+            n.dbg("file preview failed: {s}", .{@errorName(err)});
+            return item_arena.deinit();
+        };
+        n.dbg("file preview {s}: {d} bytes", .{ id, bytes.len });
+        const copy_id = ia.dupe(u8, id) catch return item_arena.deinit();
+        n.emit(.{ .arena = item_arena, .update = .{ .file_image = .{ .id = copy_id, .bytes = bytes } } });
+    }
+
     fn markRead(n: *Net, api: *slack.http.Api, channel: []const u8, ts: []const u8) void {
         var tmp = std.heap.ArenaAllocator.init(n.gpa);
         defer tmp.deinit();
@@ -1127,6 +1271,8 @@ pub const Net = struct {
                 switch (cmd) {
                     .quit => return,
                     .send => |m| try n.postMessage(api, m.channel, m.text, m.thread_ts),
+                    .fetch_image => |m| n.fetchFileImage(api, m.id, m.url),
+                    .upload => |m| try n.uploadFiles(api, m.channel, m.text, m.thread_ts, m.paths),
                     .mark => |m| n.markRead(api, m.channel, m.ts),
                     .presence => |away| n.callPresence(api, away),
                     .feed => |kind| n.fetchFeed(api, kind) catch |e| try soft(e),
@@ -1259,7 +1405,7 @@ pub const Net = struct {
             n.emit(.{ .arena = item_arena, .update = .{ .thread_message = .{
                 .channel = m.channel,
                 .thread_ts = m.thread_ts.?,
-                .message = .{ .ts = m.ts, .user = m.user, .text = m.text, .thread_ts = m.thread_ts, .subtype = m.subtype },
+                .message = .{ .ts = m.ts, .user = m.user, .text = m.text, .thread_ts = m.thread_ts, .subtype = m.subtype, .files = fileInfos(item_arena.allocator(), m.files) catch &.{} },
             } } });
             return;
         }
@@ -1278,9 +1424,10 @@ pub const Net = struct {
                     .text = m.text,
                     .thread_ts = m.thread_ts,
                     .subtype = m.subtype,
+                    .files = fileInfos(item_arena.allocator(), m.files) catch &.{},
                 } } };
             },
-            .message_changed => |c| .{ .edited = .{ .channel = c.channel, .ts = c.ts, .text = c.text } },
+            .message_changed => |c| .{ .edited = .{ .channel = c.channel, .ts = c.ts, .text = c.text, .files = fileInfos(item_arena.allocator(), c.files) catch &.{} } },
             .message_deleted => |d| .{ .deleted = .{ .channel = d.channel, .ts = d.ts } },
             .reply_count => |r| .{ .reply_count = .{ .channel = r.channel, .ts = r.ts, .count = r.count } },
             .reaction => |r| .{ .reaction = .{ .channel = r.channel, .ts = r.ts, .name = r.name, .user = r.user, .added = r.added } },
@@ -1446,7 +1593,43 @@ fn messageInfo(arena: std.mem.Allocator, o: std.json.ObjectMap, self_id: []const
         .subtype = if (json.str(o, "subtype")) |t| try arena.dupe(u8, t) else null,
         .reactions = reactions.items,
         .reply_count = replies,
+        .files = try fileInfos(arena, json.arr(o, "files")),
     };
+}
+
+/// Slack's `files` array as what we show: images carry a preview, the rest a link
+fn fileInfos(arena: std.mem.Allocator, files: []const std.json.Value) std.mem.Allocator.Error![]const store.FileInfo {
+    var out: std.ArrayList(store.FileInfo) = .empty;
+    for (files) |fv| {
+        if (fv != .object) continue;
+        const f = fv.object;
+        const id = json.str(f, "id") orelse continue;
+        // Gone (deleted or not shared with us): nothing to show
+        if (json.str(f, "mode")) |mode| if (std.mem.eql(u8, mode, "tombstone")) continue;
+        var info: store.FileInfo = .{
+            .id = try arena.dupe(u8, id),
+            .name = try arena.dupe(u8, json.str(f, "name") orelse json.str(f, "title") orelse "file"),
+            .mimetype = try arena.dupe(u8, json.str(f, "mimetype") orelse ""),
+            .link = try arena.dupe(u8, json.str(f, "permalink") orelse ""),
+        };
+        // The preview a message shows: 360 wide, as Slack's own does
+        if (json.str(f, "thumb_360")) |url| {
+            const w = dimension(f, "thumb_360_w");
+            const h = dimension(f, "thumb_360_h");
+            if (w > 0 and h > 0) {
+                info.thumb = try arena.dupe(u8, url);
+                info.thumb_w = w;
+                info.thumb_h = h;
+            }
+        }
+        try out.append(arena, info);
+    }
+    return out.items;
+}
+
+fn dimension(o: std.json.ObjectMap, key: []const u8) u32 {
+    const v = o.get(key) orelse return 0;
+    return if (v == .integer) std.math.cast(u32, v.integer) orelse 0 else 0;
 }
 
 /// `mpdm-ada--grace--sam-1` to `ada, grace, sam`

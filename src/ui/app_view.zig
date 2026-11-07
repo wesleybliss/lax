@@ -10,6 +10,7 @@ const var_list = @import("var_list.zig");
 const theme = @import("theme.zig");
 const open_url = @import("open_url.zig");
 const composer_mod = @import("composer.zig");
+const attachments = @import("attachments.zig");
 const layout_mod = @import("layout.zig");
 const settings_mod = @import("settings.zig");
 
@@ -42,6 +43,12 @@ const thread_w: f32 = 400;
 const typing_h: f32 = 24;
 /// Outgoing typing events are sent at most this often
 const typing_send_ms = 3000;
+/// A file's name line, and the gap under a file
+const file_name_h: f32 = 22;
+const file_gap: f32 = 6;
+const file_chip_h: f32 = 36;
+/// Largest an image preview is drawn
+const file_max: f32 = 300;
 const quick_reactions = [_][]const u8{ "+1", "heart", "tada" };
 
 /// What the UI asks of the network side
@@ -49,6 +56,8 @@ pub const Actions = struct {
     ctx: *anyopaque,
     open: *const fn (ctx: *anyopaque, channel: []const u8) void,
     send: *const fn (ctx: *anyopaque, channel: []const u8, text: []const u8, thread_ts: ?[]const u8) void,
+    /// Post files (paths), with `text` (maybe empty) as their comment
+    upload: *const fn (ctx: *anyopaque, channel: []const u8, text: []const u8, thread_ts: ?[]const u8, paths: []const []const u8) void,
     older: *const fn (ctx: *anyopaque, channel: []const u8, before: []const u8) void,
     open_thread: *const fn (ctx: *anyopaque, channel: []const u8, ts: []const u8) void,
     react: *const fn (ctx: *anyopaque, channel: []const u8, ts: []const u8, name: []const u8, add: bool) void,
@@ -58,6 +67,8 @@ pub const Actions = struct {
     manual: *const fn (ctx: *anyopaque, url: []const u8, token: []const u8, cookie: []const u8) void,
     /// Away (`true`) or automatic presence
     set_presence: *const fn (ctx: *anyopaque, away: bool) void,
+    /// Download a file's preview picture (id, its private URL)
+    fetch_image: *const fn (ctx: *anyopaque, id: []const u8, url: []const u8) void,
     /// Load (or refresh) one of the top-row pages
     load_feed: *const fn (ctx: *anyopaque, kind: store.FeedKind) void,
 };
@@ -159,6 +170,11 @@ pub const State = struct {
     list: var_list.VarList,
     list_rev: u32 = 0,
     main_composer: composer_mod.Composer,
+    /// Files dropped on the conversation, and on the thread panel
+    main_attach: attachments.Pending,
+    /// Files whose preview was asked for
+    images_asked: std.StringHashMapUnmanaged(void) = .empty,
+    thread_attach: attachments.Pending,
     marked_ts: []u8 = &.{},
     pending_select: ?[]const u8 = null,
     pal: theme.Palette = undefined,
@@ -224,12 +240,17 @@ pub const State = struct {
     opener: *const fn (gpa: std.mem.Allocator, io: std.Io, url: []const u8) void = open_url.open,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, st: *store.Store, actions: Actions) State {
-        return .{ .gpa = gpa, .io = io, .store = st, .actions = actions, .list = .{ .gpa = gpa }, .main_composer = .init(gpa), .thread_composer = .init(gpa), .settings_arena = .init(gpa), .themes_arena = .init(gpa) };
+        return .{ .gpa = gpa, .io = io, .store = st, .actions = actions, .list = .{ .gpa = gpa }, .main_composer = .init(gpa), .thread_composer = .init(gpa), .main_attach = .init(gpa), .thread_attach = .init(gpa), .settings_arena = .init(gpa), .themes_arena = .init(gpa) };
     }
 
     pub fn deinit(s: *State) void {
         s.list.deinit();
         s.main_composer.deinit();
+        s.main_attach.deinit();
+        var asked = s.images_asked.keyIterator();
+        while (asked.next()) |k| s.gpa.free(k.*);
+        s.images_asked.deinit(s.gpa);
+        s.thread_attach.deinit();
         s.manual_url.deinit();
         s.manual_token.deinit();
         s.manual_cookie.deinit();
@@ -260,9 +281,11 @@ pub const State = struct {
         s.list_rev = 0;
         s.older_pending = false;
         s.store.closeThread();
+        s.dropImages();
         if (s.store.channel(id)) |c| c.unread = false;
         s.actions.open(s.actions.ctx, id);
         s.main_composer.clear();
+        s.main_attach.clear();
     }
 
     /// Call after the store changed, on the UI thread: marks what the user
@@ -318,7 +341,22 @@ pub const State = struct {
         var h: f32 = 0;
         if (m.reactions.items.len > 0) h += reaction_row_h;
         if (!in_thread and m.reply_count > 0) h += reply_row_h;
+        for (m.files) |f| h += fileHeight(f);
         return h;
+    }
+
+    /// An image preview's size on screen: what Slack says it is, within `file_max`
+    fn previewSize(f: store.FileInfo) struct { w: f32, h: f32 } {
+        const w: f32 = @floatFromInt(f.thumb_w);
+        const h: f32 = @floatFromInt(f.thumb_h);
+        const k = @min(1, @min(file_max / w, file_max / h));
+        return .{ .w = @round(w * k), .h = @round(h * k) };
+    }
+
+    /// Known from the message alone (not from the picture arriving), so rows keep their height
+    fn fileHeight(f: store.FileInfo) f32 {
+        if (f.thumb_w == 0 or f.thumb_h == 0) return file_chip_h + file_gap;
+        return file_name_h + previewSize(f).h + file_gap;
     }
 
     /// Width the message text wraps to, in a list `width` wide
@@ -430,6 +468,8 @@ pub const State = struct {
         s.list.reset();
         s.list_rev = 0;
         s.main_composer.clear();
+        s.main_attach.clear();
+        s.dropImages();
         // The command-line channel only makes sense for the first workspace
         s.preferred = null;
     }
@@ -1209,6 +1249,7 @@ pub const State = struct {
     fn main(s: *State, c: *ui.Context) void {
         const col = ui.div(c).column().grow().hFull().bg(c.theme.background);
         defer col.end();
+        s.dropZone(c, col.index, &s.main_attach);
         s.topBar(c);
         ui.divider(c);
         if (s.cur) |cur| {
@@ -1312,11 +1353,58 @@ pub const State = struct {
                 if (nl >= r.text.len) break;
                 start = nl + 1;
             }
+            for (m.files) |f| s.drawFile(c, f);
             if (m.reactions.items.len > 0) s.reactionRow(c, m, channel_id);
             if (!in_thread and m.reply_count > 0) s.replyLink(c, m, channel_id);
         }
 
         if (hovered) if (row_it.rect) |rect| s.toolbar(c, rect, m, channel_id, in_thread);
+    }
+
+    /// An attached file: an image's preview under its name, anything else as
+    /// a chip. Either opens the file in the browser.
+    fn drawFile(s: *State, c: *ui.Context, f: store.FileInfo) void {
+        if (f.thumb_w == 0 or f.thumb_h == 0) {
+            const wrap = ui.div(c).column().h(fileHeight(f));
+            defer wrap.end();
+            const chip = ui.div(c).row().itemsCenter().gap(8).h(file_chip_h).maxW(file_max).px(12).rounded(10).control().bg(s.pal.container_high).border(c.theme.border).borderW(1).hover(c.theme.surface_hover);
+            defer chip.end();
+            if (chip.clicked() and f.link.len > 0) s.opener(s.gpa, s.io, f.link);
+            ui.text(c, "📎", .{ .size = 14 });
+            ui.text(c, f.name, .{ .size = 14, .truncate = .ellipsis });
+            return;
+        }
+        const size = previewSize(f);
+        const block = ui.div(c).column().w(size.w).h(fileHeight(f));
+        defer block.end();
+        const label = ui.div(c).row().w(size.w).h(file_name_h).itemsCenter();
+        ui.text(c, f.name, .{ .size = 13, .color = c.theme.muted, .truncate = .ellipsis });
+        label.end();
+        const frame = ui.div(c).w(size.w).h(size.h).rounded(8).control().bg(s.pal.container_high);
+        defer frame.end();
+        if (frame.clicked() and f.link.len > 0) s.opener(s.gpa, s.io, f.link);
+        if (s.store.fileImage(f.id)) |bytes| {
+            _ = ui.image(c, .{ .key = f.id, .bytes = bytes, .max_width = size.w, .max_height = size.h, .radius = 8, .scale = 1 });
+        } else s.wantImage(f);
+    }
+
+    /// The conversation changed: the previews held go, and can be asked for again
+    fn dropImages(s: *State) void {
+        s.store.clearImages();
+        var asked = s.images_asked.keyIterator();
+        while (asked.next()) |k| s.gpa.free(k.*);
+        s.images_asked.clearAndFree(s.gpa);
+    }
+
+    /// Asks for a preview once; it shows when it arrives
+    fn wantImage(s: *State, f: store.FileInfo) void {
+        if (f.thumb.len == 0 or s.images_asked.contains(f.id)) return;
+        const key = s.gpa.dupe(u8, f.id) catch return;
+        s.images_asked.put(s.gpa, key, {}) catch {
+            s.gpa.free(key);
+            return;
+        };
+        s.actions.fetch_image(s.actions.ctx, f.id, f.thumb);
     }
 
     fn reactionRow(s: *State, c: *ui.Context, m: *const store.Message, channel_id: []const u8) void {
@@ -1345,6 +1433,7 @@ pub const State = struct {
     fn openThread(s: *State, channel_id: []const u8, ts: []const u8) void {
         s.store.showThread(channel_id, ts) catch return;
         s.thread_composer.clear();
+        s.thread_attach.clear();
         s.actions.open_thread(s.actions.ctx, channel_id, ts);
     }
 
@@ -1381,6 +1470,7 @@ pub const State = struct {
         const t = &s.store.thread.?;
         const col = ui.div(c).column().w(thread_w).hFull().bg(c.theme.background);
         defer col.end();
+        s.dropZone(c, col.index, &s.thread_attach);
         {
             const head = ui.div(c).row().itemsCenter().wFull().h(64).px(20);
             defer head.end();
@@ -1399,11 +1489,12 @@ pub const State = struct {
             for (t.messages.items, 0..) |*m, i| s.drawMessage(c, m, hasHeaderIn(t.messages.items, i), null, t.channel, true);
             c.end();
         }
+        s.thread_attach.view(c, s.pal);
         const bar = ui.div(c).row().wFull().px(16).py(12);
         defer bar.end();
-        const res = s.thread_composer.view(c, s.store, s.pal, .{ .placeholder = "Reply…", .max_lines = 6 });
+        const res = s.thread_composer.view(c, s.store, s.pal, .{ .placeholder = "Reply…", .max_lines = 6, .allow_empty = !s.thread_attach.isEmpty() });
         if (res.submitted) |text| {
-            s.actions.send(s.actions.ctx, t.channel, text, t.ts);
+            s.submit(t.channel, text, t.ts, &s.thread_attach);
             s.thread_composer.clear();
         }
     }
@@ -1468,20 +1559,45 @@ pub const State = struct {
     }
 
     fn composer(s: *State, c: *ui.Context) void {
+        s.main_attach.view(c, s.pal);
         const bar = ui.div(c).row().wFull().px(20).pb(16);
         defer bar.end();
         const placeholder = if (s.cur) |cur| c.print("Message {s}{s}", .{ if (cur.kind == .channel or cur.kind == .private) "#" else "", s.store.channelName(cur) }) else "Message";
         const lines: u8 = if (s.composer_expanded) composer_tall_lines else composer_lines;
-        const res = s.main_composer.view(c, s.store, s.pal, .{ .placeholder = placeholder, .min_lines = lines, .max_lines = lines });
+        const res = s.main_composer.view(c, s.store, s.pal, .{ .placeholder = placeholder, .min_lines = lines, .max_lines = lines, .allow_empty = !s.main_attach.isEmpty() });
         if (res.rect) |rect| s.expandToggle(c, rect);
         if (res.changed and s.main_composer.text().len > 0) s.signalTyping();
         if (res.submitted) |text| {
             if (s.selected) |id| {
-                s.actions.send(s.actions.ctx, id, text, null);
+                s.submit(id, text, null, &s.main_attach);
                 s.list.stickToEnd();
             }
             s.main_composer.clear();
         }
+    }
+
+    /// Sends a message, with the files waiting (if any) attached to it
+    fn submit(s: *State, channel: []const u8, text: []const u8, thread_ts: ?[]const u8, files: *attachments.Pending) void {
+        if (files.isEmpty()) {
+            s.actions.send(s.actions.ctx, channel, text, thread_ts);
+        } else {
+            s.actions.upload(s.actions.ctx, channel, text, thread_ts, files.paths());
+            files.clear();
+        }
+    }
+
+    /// Box `index` takes files dropped from the file manager (into `into`),
+    /// and shows it will while a drag is over it.
+    fn dropZone(s: *State, c: *ui.Context, index: u32, into: *attachments.Pending) void {
+        _ = s;
+        c.acceptDrop(index);
+        if (c.dropAt(index)) |d| into.addUrls(d.urls);
+        const p = c.input.drag_over orelse return;
+        const r = c.rects.get(c.node(index).id) orelse return;
+        if (!r.contains(p)) return;
+        const veil = ui.div(c).fixed().offset(r.x + 8, r.y + 8).layer(30).w(r.w - 16).h(r.h - 16).center().rounded(16).bg(c.theme.accent.alpha(0.1)).border(c.theme.accent).borderW(2);
+        defer veil.end();
+        ui.text(c, "Drop to attach", .{ .size = 18, .weight = .semibold, .color = c.theme.accent });
     }
 
     /// A small button on the message box's top border: 2 lines or 10

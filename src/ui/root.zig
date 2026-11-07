@@ -5,6 +5,7 @@ pub const chat_view = @import("chat_view.zig");
 pub const app_view = @import("app_view.zig");
 pub const theme = @import("theme.zig");
 pub const composer = @import("composer.zig");
+pub const attachments = @import("attachments.zig");
 pub const open_url = @import("open_url.zig");
 pub const layout = @import("layout.zig");
 pub const settings = @import("settings.zig");
@@ -15,5 +16,6 @@ test {
     _ = settings;
     _ = theme;
     _ = composer;
+    _ = attachments;
     _ = @import("tests.zig");
 }

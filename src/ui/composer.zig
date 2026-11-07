@@ -45,6 +45,8 @@ pub const Options = struct {
     min_lines: u8 = 1,
     max_lines: u16 = 8,
     size: f32 = 15,
+    /// Enter submits an empty box too (files are waiting to be sent)
+    allow_empty: bool = false,
 };
 
 pub const Composer = struct {
@@ -269,7 +271,7 @@ pub const Composer = struct {
         var out: Result = .{ .changed = res.changed, .rect = box_it.rect };
         if (res.submitted) {
             const trimmed = std.mem.trim(u8, k.buf.text(), " \t\r\n");
-            if (trimmed.len > 0) out.submitted = k.expand(arena, trimmed);
+            if (trimmed.len > 0) out.submitted = k.expand(arena, trimmed) else if (opts.allow_empty) out.submitted = "";
         }
         return out;
     }

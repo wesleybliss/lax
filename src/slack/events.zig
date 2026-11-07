@@ -25,6 +25,8 @@ pub const Message = struct {
     text: []const u8,
     /// Bookkeeping events (e.g. `message_replied`): never render these
     hidden: bool,
+    /// The `files` array as sent, for the caller to read
+    files: []const std.json.Value = &.{},
 
     pub fn isThreadReply(m: Message) bool {
         const t = m.thread_ts orelse return false;
@@ -37,6 +39,7 @@ pub const Changed = struct {
     channel: []const u8,
     ts: []const u8,
     text: []const u8,
+    files: []const std.json.Value = &.{},
 };
 
 /// A thread's parent got a new reply count (the hidden `message_replied`)
@@ -117,6 +120,7 @@ pub fn parse(arena: std.mem.Allocator, frame: []const u8) Error!Event {
                     .channel = str(o, "channel") orelse return error.BadFrame,
                     .ts = str(inner, "ts") orelse return error.BadFrame,
                     .text = str(inner, "text") orelse "",
+                    .files = arr(inner, "files"),
                 } };
             }
             if (eql(u8, sub, "message_replied")) {
@@ -141,6 +145,7 @@ pub fn parse(arena: std.mem.Allocator, frame: []const u8) Error!Event {
         .subtype = str(o, "subtype"),
         .text = str(o, "text") orelse "",
         .hidden = flag(o, "hidden"),
+        .files = arr(o, "files"),
     } };
     if (eql(u8, kind, "user_typing")) return .{ .typing = .{
         .channel = str(o, "channel") orelse return error.BadFrame,
@@ -186,6 +191,11 @@ pub fn parse(arena: std.mem.Allocator, frame: []const u8) Error!Event {
 fn str(o: std.json.ObjectMap, k: []const u8) ?[]const u8 {
     const v = o.get(k) orelse return null;
     return if (v == .string) v.string else null;
+}
+
+fn arr(o: std.json.ObjectMap, k: []const u8) []const std.json.Value {
+    const v = o.get(k) orelse return &.{};
+    return if (v == .array) v.array.items else &.{};
 }
 
 fn obj(o: std.json.ObjectMap, k: []const u8) ?std.json.ObjectMap {

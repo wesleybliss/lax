@@ -9,6 +9,15 @@ const build_options = @import("build_options");
 const png_decode = @import("png_decode.zig");
 
 const portable = build_options.portable or !(builtin.os.tag == .macos or builtin.os.tag == .ios);
+/// What GTK can read beyond PNG, on Linux
+const gdk = if (builtin.os.tag == .linux) @import("../linux/texture_decode.zig") else struct {
+    pub fn decode(_: std.mem.Allocator, _: []const u8) error{InvalidImage}!struct { width: u32, height: u32, bgra: []u8 } {
+        return error.InvalidImage;
+    }
+    pub fn dimensions(_: []const u8) ?struct { width: u32, height: u32 } {
+        return null;
+    }
+};
 const imageio = if (portable) void else @import("image.zig");
 
 pub const size: u32 = 2048;
@@ -306,6 +315,7 @@ fn probeHeader(bytes: []const u8) ?Info {
         const h = std.mem.readInt(u32, bytes[20..24], .big);
         if (w > 0 and h > 0 and @as(u64, w) * h <= 64 * 1024 * 1024) return .{ .width = w, .height = h };
     }
+    if (builtin.os.tag == .linux and !std.mem.startsWith(u8, bytes, "\x89PNG")) if (gdk.dimensions(bytes)) |d| return .{ .width = d.width, .height = d.height };
     return null;
 }
 
@@ -334,6 +344,10 @@ fn load(gpa: std.mem.Allocator, bytes: []const u8, side: u32) !Decoded {
 fn decode(gpa: std.mem.Allocator, bytes: []const u8) !Raw {
     if (!portable) {
         const d = try imageio.decode(gpa, bytes);
+        return .{ .width = d.width, .height = d.height, .bgra = d.bgra };
+    }
+    if (builtin.os.tag == .linux and !std.mem.startsWith(u8, bytes, "\x89PNG")) {
+        const d = try gdk.decode(gpa, bytes);
         return .{ .width = d.width, .height = d.height, .bgra = d.bgra };
     }
     const d = try png_decode.decode(gpa, bytes);
