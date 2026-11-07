@@ -21,6 +21,12 @@ pub const Command = union(enum) {
     older: struct { channel: []u8, before: []u8 },
     open_thread: struct { channel: []u8, ts: []u8 },
     react: struct { channel: []u8, ts: []u8, name: []u8, add: bool },
+    /// Replace a message's text (`chat.update`)
+    edit: struct { channel: []u8, ts: []u8, text: []u8 },
+    /// Delete one of our messages
+    delete: struct { channel: []u8, ts: []u8 },
+    /// Add a message to Saved
+    save: struct { channel: []u8, ts: []u8 },
     /// The user is typing in a conversation
     typing: []u8,
     /// The user opened a conversation: load its history if needed, mark read
@@ -67,6 +73,19 @@ pub const Command = union(enum) {
                 gpa.free(m.channel);
                 gpa.free(m.ts);
                 gpa.free(m.name);
+            },
+            .edit => |m| {
+                gpa.free(m.channel);
+                gpa.free(m.ts);
+                gpa.free(m.text);
+            },
+            .delete => |m| {
+                gpa.free(m.channel);
+                gpa.free(m.ts);
+            },
+            .save => |m| {
+                gpa.free(m.channel);
+                gpa.free(m.ts);
             },
             .typing => |ch| gpa.free(ch),
             .open => |ch| gpa.free(ch),
@@ -247,6 +266,25 @@ pub const Net = struct {
         const t = n.gpa.dupe(u8, ts) catch return;
         const nm = n.gpa.dupe(u8, name) catch return;
         n.commands.push(n.gpa, n.io, .{ .react = .{ .channel = ch, .ts = t, .name = nm, .add = add } }) catch {};
+    }
+
+    pub fn edit(n: *Net, channel: []const u8, ts: []const u8, text: []const u8) void {
+        const ch = n.gpa.dupe(u8, channel) catch return;
+        const t = n.gpa.dupe(u8, ts) catch return;
+        const tx = n.gpa.dupe(u8, text) catch return;
+        n.commands.push(n.gpa, n.io, .{ .edit = .{ .channel = ch, .ts = t, .text = tx } }) catch {};
+    }
+
+    pub fn delete(n: *Net, channel: []const u8, ts: []const u8) void {
+        const ch = n.gpa.dupe(u8, channel) catch return;
+        const t = n.gpa.dupe(u8, ts) catch return;
+        n.commands.push(n.gpa, n.io, .{ .delete = .{ .channel = ch, .ts = t } }) catch {};
+    }
+
+    pub fn save(n: *Net, channel: []const u8, ts: []const u8) void {
+        const ch = n.gpa.dupe(u8, channel) catch return;
+        const t = n.gpa.dupe(u8, ts) catch return;
+        n.commands.push(n.gpa, n.io, .{ .save = .{ .channel = ch, .ts = t } }) catch {};
     }
 
     pub fn typing(n: *Net, channel: []const u8) void {
@@ -1217,6 +1255,19 @@ pub const Net = struct {
         // The socket reports the change; the store updates from that
     }
 
+    /// A call on one message whose result is the socket's echo (an edit, a
+    /// delete) or nothing to show (a save). A failure goes to the status line.
+    fn callMessage(n: *Net, api: *slack.http.Api, method: []const u8, what: []const u8, params: []const slack.http.Param) SessionError!void {
+        var tmp = std.heap.ArenaAllocator.init(n.gpa);
+        defer tmp.deinit();
+        _ = api.call(tmp.allocator(), method, params) catch |err| {
+            if (err == error.SlackError) {
+                if (api.diag.isAuthError()) return error.AuthFailed;
+                n.emitStatus("{s} failed: {s}", .{ what, api.diag.slackError() });
+            } else n.emitStatus("{s} failed: {s}", .{ what, @errorName(err) });
+        };
+    }
+
     /// presence_sub for the people in our DMs, then ask for their current
     /// state (the socket is opened with no_query_on_subscribe)
     fn subscribePresence(n: *Net, sock: *slack.realtime.Socket) void {
@@ -1279,6 +1330,9 @@ pub const Net = struct {
                     .older => |m| n.fetchHistory(api, m.channel, m.before) catch |e| try soft(e),
                     .open_thread => |m| n.fetchReplies(api, m.channel, m.ts) catch |e| try soft(e),
                     .react => |m| try n.callReact(api, m.channel, m.ts, m.name, m.add),
+                    .edit => |m| try n.callMessage(api, "chat.update", "Edit", &.{ .{ "channel", m.channel }, .{ "ts", m.ts }, .{ "text", m.text } }),
+                    .delete => |m| try n.callMessage(api, "chat.delete", "Delete", &.{ .{ "channel", m.channel }, .{ "ts", m.ts } }),
+                    .save => |m| try n.callMessage(api, "saved.add", "Save", &.{ .{ "item_type", "message" }, .{ "item_id", m.channel }, .{ "ts", m.ts } }),
                     .typing => |ch| n.sendTyping(sock, ch),
                     .manual => {},
                     .switch_team => |id| {

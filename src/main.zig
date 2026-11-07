@@ -88,6 +88,21 @@ fn actionReact(ctx: *anyopaque, channel: []const u8, ts: []const u8, name: []con
     net.react(channel, ts, name, add);
 }
 
+fn actionEdit(ctx: *anyopaque, channel: []const u8, ts: []const u8, text: []const u8) void {
+    const net: *Net = @ptrCast(@alignCast(ctx));
+    net.edit(channel, ts, text);
+}
+
+fn actionDelete(ctx: *anyopaque, channel: []const u8, ts: []const u8) void {
+    const net: *Net = @ptrCast(@alignCast(ctx));
+    net.delete(channel, ts);
+}
+
+fn actionSave(ctx: *anyopaque, channel: []const u8, ts: []const u8) void {
+    const net: *Net = @ptrCast(@alignCast(ctx));
+    net.save(channel, ts);
+}
+
 fn actionTyping(ctx: *anyopaque, channel: []const u8) void {
     const net: *Net = @ptrCast(@alignCast(ctx));
     net.typing(channel);
@@ -144,6 +159,9 @@ pub fn main(init: std.process.Init) !void {
         .older = actionOlder,
         .open_thread = actionOpenThread,
         .react = actionReact,
+        .edit = actionEdit,
+        .delete = actionDelete,
+        .save = actionSave,
         .typing = actionTyping,
         .mark = actionMark,
         .switch_team = actionSwitchTeam,
@@ -168,6 +186,7 @@ pub fn main(init: std.process.Init) !void {
         }
         state.restoreSidebar(saved.sidebar);
         state.applySettings(ui.settings.load(init.arena.allocator(), init.io, dir));
+        state.recents.load(init.arena.allocator(), init.io, dir);
     }
 
     // Open with the last known state; the network side then updates it

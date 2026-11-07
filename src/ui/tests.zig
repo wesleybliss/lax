@@ -229,6 +229,15 @@ const Fake = struct {
     away: ?bool = null,
     feed_calls: usize = 0,
     feed_kind: ?store.FeedKind = null,
+    edited: [128]u8 = undefined,
+    edited_len: usize = 0,
+    deleted_ts: [32]u8 = undefined,
+    deleted_len: usize = 0,
+    saved_calls: usize = 0,
+    marked: [32]u8 = undefined,
+    marked_len: usize = 0,
+    send_channel: [16]u8 = undefined,
+    send_channel_len: usize = 0,
 
     fn actions(f: *Fake) app_view.Actions {
         return .{
@@ -240,6 +249,9 @@ const Fake = struct {
             .older = older,
             .open_thread = openThread,
             .react = react,
+            .edit = edit,
+            .delete = delete,
+            .save = save,
             .typing = typing,
             .mark = mark,
             .switch_team = switchTeam,
@@ -264,8 +276,10 @@ const Fake = struct {
         const f: *Fake = @ptrCast(@alignCast(ctx));
         f.opened = channel;
     }
-    fn send(ctx: *anyopaque, _: []const u8, text: []const u8, thread_ts: ?[]const u8) void {
+    fn send(ctx: *anyopaque, channel: []const u8, text: []const u8, thread_ts: ?[]const u8) void {
         const f: *Fake = @ptrCast(@alignCast(ctx));
+        @memcpy(f.send_channel[0..channel.len], channel);
+        f.send_channel_len = channel.len;
         @memcpy(f.sent_text[0..text.len], text);
         f.sent_len = text.len;
         f.sent_thread = thread_ts != null;
@@ -303,7 +317,25 @@ const Fake = struct {
         const f: *Fake = @ptrCast(@alignCast(ctx));
         f.typing_calls += 1;
     }
-    fn mark(_: *anyopaque, _: []const u8, _: []const u8) void {}
+    fn mark(ctx: *anyopaque, _: []const u8, ts: []const u8) void {
+        const f: *Fake = @ptrCast(@alignCast(ctx));
+        @memcpy(f.marked[0..ts.len], ts);
+        f.marked_len = ts.len;
+    }
+    fn edit(ctx: *anyopaque, _: []const u8, _: []const u8, text: []const u8) void {
+        const f: *Fake = @ptrCast(@alignCast(ctx));
+        @memcpy(f.edited[0..text.len], text);
+        f.edited_len = text.len;
+    }
+    fn delete(ctx: *anyopaque, _: []const u8, ts: []const u8) void {
+        const f: *Fake = @ptrCast(@alignCast(ctx));
+        @memcpy(f.deleted_ts[0..ts.len], ts);
+        f.deleted_len = ts.len;
+    }
+    fn save(ctx: *anyopaque, _: []const u8, _: []const u8) void {
+        const f: *Fake = @ptrCast(@alignCast(ctx));
+        f.saved_calls += 1;
+    }
     fn switchTeam(ctx: *anyopaque, team: []const u8) void {
         const f: *Fake = @ptrCast(@alignCast(ctx));
         f.team = team;
@@ -661,7 +693,50 @@ test "an older page keeps the reader's place" {
     }
 }
 
-test "hover toolbar shows quick reactions and Reply" {
+/// The last place `s` is drawn: toolbar buttons sit right of the sidebar's own glyphs
+fn findLast(t: *ui.Tester, str: []const u8) ?ui.Rect {
+    var found: ?ui.Rect = null;
+    for (t.ctx.nodes.items) |n| switch (n.content) {
+        .text => |tx| if (std.mem.eql(u8, tx.str, str)) {
+            found = n.rect;
+        },
+        .icon => |ic| if (std.mem.eql(u8, ic.name, str)) {
+            found = n.rect;
+        },
+        else => {},
+    };
+    return found;
+}
+
+fn clickLast(t: *ui.Tester, str: []const u8) !void {
+    const r = findLast(t, str) orelse return error.TextNotFound;
+    t.click(r.x + r.w / 2, r.y + r.h / 2);
+}
+
+/// Hovers a message by its text so its toolbar shows
+fn hoverMessage(t: *ui.Tester, text: []const u8) !void {
+    const r = t.findText(text) orelse return error.TextNotFound;
+    t.moveTo(r.x + 40, r.y + 8);
+    for (0..3) |_| t.frame();
+}
+
+const own_text = "nice. `zig build` took _4s_ & passed ~flaky~";
+const own_shown = "nice. zig build took 4s & passed flaky";
+const theirs_text = "morning! deploy is green, see the run";
+
+/// Opens a message's overflow menu
+fn openOverflow(t: *ui.Tester, text: []const u8) !void {
+    try hoverMessage(t, text);
+    try clickLast(t, "⋮");
+    t.settle(1);
+}
+
+fn menuState(gpa: std.mem.Allocator, st: *store.Store, fake: *Fake) !app_view.State {
+    try st.apply(.{ .teams = .{ .list = &.{.{ .id = "T1", .name = "Acme", .url = "https://acme.slack.com/" }}, .active = "T1" } });
+    return seedFor(gpa, st, fake);
+}
+
+test "hover toolbar: three emoji, picker, reply, forward and more" {
     const gpa = std.testing.allocator;
     var st = store.Store.init(gpa);
     defer st.deinit();
@@ -672,14 +747,248 @@ test "hover toolbar shows quick reactions and Reply" {
     try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
     defer t.deinit();
     for (0..4) |_| t.frame();
-    const r = t.findText("morning! deploy is green, see the run").?;
-    t.moveTo(r.x + 100, r.y + 10);
-    for (0..3) |_| t.frame();
+    try hoverMessage(&t, theirs_text);
     try t.screenshot("/tmp/lax-hover.png");
-    try std.testing.expect(t.hasText("Reply"));
-    try t.clickText("Reply");
+    for ([_][]const u8{ "👍", "👀", "🙌", "🙂", "💬", "arrow.right", "⋮" }) |g| try std.testing.expect(findLast(&t, g) != null);
+    try std.testing.expect(findLast(&t, "arrowshape.turn.up.left") == null);
+    try clickLast(&t, "💬");
     for (0..2) |_| t.frame();
     try std.testing.expectEqual(@as(usize, 1), fake.thread_calls);
+}
+
+test "toolbar emoji are the recent ones, newest first" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..4) |_| t.frame();
+    try hoverMessage(&t, theirs_text);
+    try clickLast(&t, "👀");
+    t.frame();
+    try std.testing.expectEqualStrings("eyes", fake.react_name[0..fake.react_len]);
+    try std.testing.expect(fake.react_add);
+    // Eyes now leads, and the default thumbs up and raised hands follow
+    try hoverMessage(&t, theirs_text);
+    const first = findLast(&t, "👀").?;
+    const second = findLast(&t, "👍").?;
+    try std.testing.expect(first.x < second.x);
+}
+
+test "emoji picker: search, pick, and it becomes a recent" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..4) |_| t.frame();
+    try hoverMessage(&t, theirs_text);
+    try clickLast(&t, "🙂");
+    t.settle(1);
+    try t.screenshot("/tmp/lax-picker.png");
+    try std.testing.expect(t.hasText("Search emoji"));
+    t.typeText("tada");
+    t.settle(1);
+    try t.screenshot("/tmp/lax-picker-search.png");
+    try clickLast(&t, "🎉");
+    t.settle(1);
+    try std.testing.expectEqualStrings("tada", fake.react_name[0..fake.react_len]);
+    try std.testing.expect(fake.react_add);
+    try std.testing.expectEqualStrings("tada", state.recents.get(0));
+    try std.testing.expect(!t.hasText("Search emoji"));
+}
+
+test "overflow menu: own messages can be edited and deleted, others' cannot" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try menuState(gpa, &st, &fake);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..4) |_| t.frame();
+    try openOverflow(&t, theirs_text);
+    try t.screenshot("/tmp/lax-menu-theirs.png");
+    for ([_][]const u8{ "Mark unread", "Add to saved", "Copy link", "Copy message" }) |label| try std.testing.expect(t.hasText(label));
+    try std.testing.expect(!t.hasText("Edit message"));
+    try std.testing.expect(!t.hasText("Delete message…"));
+    _ = t.shortcut(.{ .key = ui.Shortcut.escape });
+    t.settle(1);
+    try std.testing.expect(!t.hasText("Copy link"));
+    try openOverflow(&t, own_shown);
+    try t.screenshot("/tmp/lax-menu-own.png");
+    try std.testing.expect(t.hasText("Edit message"));
+    try std.testing.expect(t.hasText("Delete message…"));
+}
+
+test "overflow menu: copy link and copy message, mark unread, add to saved" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try menuState(gpa, &st, &fake);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..4) |_| t.frame();
+
+    try openOverflow(&t, own_shown);
+    try t.clickText("Copy link");
+    t.settle(1);
+    try std.testing.expectEqualStrings("https://acme.slack.com/archives/C1/p1700000100000100", t.clipboard.items);
+    try std.testing.expect(t.hasText("Link copied"));
+
+    try openOverflow(&t, theirs_text);
+    try t.clickText("Copy message");
+    t.settle(1);
+    try std.testing.expectEqualStrings(theirs_text, t.clipboard.items);
+
+    try openOverflow(&t, own_shown);
+    try t.clickText("Mark unread");
+    t.settle(1);
+    try std.testing.expectEqualStrings("1700000100.000099", fake.marked[0..fake.marked_len]);
+
+    try openOverflow(&t, own_shown);
+    try t.clickText("Add to saved");
+    t.settle(1);
+    try std.testing.expectEqual(@as(usize, 1), fake.saved_calls);
+}
+
+test "overflow menu: edit loads the message, Enter saves it, Esc cancels" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try menuState(gpa, &st, &fake);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..4) |_| t.frame();
+
+    try openOverflow(&t, own_shown);
+    try t.clickText("Edit message");
+    t.settle(1);
+    try t.screenshot("/tmp/lax-edit.png");
+    try std.testing.expect(t.hasText("Editing message"));
+    try std.testing.expectEqualStrings(own_text, state.edit_composer.text());
+    // The draft box is not touched
+    try std.testing.expect(!t.hasText("Message #general"));
+    t.typeText(" (edited)");
+    t.key(.enter);
+    t.settle(1);
+    try std.testing.expectEqualStrings(own_text ++ " (edited)", fake.edited[0..fake.edited_len]);
+    try std.testing.expect(state.editing == null);
+    try std.testing.expect(t.hasText("Message #general"));
+
+    // Cancel sends nothing
+    fake.edited_len = 0;
+    try openOverflow(&t, own_shown);
+    try t.clickText("Edit message");
+    t.settle(1);
+    try t.clickText("Cancel");
+    t.settle(1);
+    try std.testing.expect(state.editing == null);
+    try std.testing.expectEqual(@as(usize, 0), fake.edited_len);
+
+    // So does Escape
+    try openOverflow(&t, own_shown);
+    try t.clickText("Edit message");
+    t.settle(1);
+    try std.testing.expect(state.editing != null);
+    _ = t.shortcut(.{ .key = ui.Shortcut.escape });
+    t.settle(1);
+    try std.testing.expect(state.editing == null);
+    try std.testing.expectEqual(@as(usize, 0), fake.edited_len);
+}
+
+test "overflow menu: delete asks first" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try menuState(gpa, &st, &fake);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..4) |_| t.frame();
+
+    try openOverflow(&t, own_shown);
+    try t.clickText("Delete message…");
+    t.settle(1);
+    try t.screenshot("/tmp/lax-delete.png");
+    try std.testing.expect(t.hasText("Delete message"));
+    try std.testing.expectEqual(@as(usize, 0), fake.deleted_len);
+    try t.clickText("Cancel");
+    t.settle(1);
+    try std.testing.expectEqual(@as(usize, 0), fake.deleted_len);
+
+    try openOverflow(&t, own_shown);
+    try t.clickText("Delete message…");
+    t.settle(1);
+    try t.clickText("Delete");
+    t.settle(1);
+    try std.testing.expectEqualStrings("1700000100.000100", fake.deleted_ts[0..fake.deleted_len]);
+}
+
+test "forward: pick a conversation and its link is posted there" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try menuState(gpa, &st, &fake);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..4) |_| t.frame();
+    try hoverMessage(&t, theirs_text);
+    try clickLast(&t, "arrow.right");
+    t.settle(1);
+    try t.screenshot("/tmp/lax-forward.png");
+    try std.testing.expect(t.hasText("Forward message to…"));
+    t.typeText("dev");
+    t.settle(1);
+    try clickLast(&t, "# dev");
+    t.settle(1);
+    try std.testing.expectEqualStrings("C2", fake.send_channel[0..fake.send_channel_len]);
+    try std.testing.expectEqualStrings("https://acme.slack.com/archives/C1/p1700000000000100", fake.sent_text[0..fake.sent_len]);
+    try std.testing.expect(t.hasText("Message forwarded"));
+}
+
+test "reply: in a DM it forwards the message's link to that same DM" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try menuState(gpa, &st, &fake);
+    defer state.deinit();
+    try st.apply(.{ .history = .{ .channel = "D1", .messages = &.{
+        .{ .ts = "1700000200.000100", .user = "U2", .text = "got a minute?" },
+    } } });
+    state.preferred = "D1";
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..4) |_| t.frame();
+    try hoverMessage(&t, "got a minute?");
+    try clickLast(&t, "arrowshape.turn.up.left");
+    t.settle(1);
+    try std.testing.expectEqualStrings("D1", fake.send_channel[0..fake.send_channel_len]);
+    try std.testing.expectEqualStrings("https://acme.slack.com/archives/D1/p1700000200000100", fake.sent_text[0..fake.sent_len]);
+    try std.testing.expect(t.hasText("Message forwarded"));
 }
 
 test "completion: @mention expands to Slack's form, :emoji: and #channel complete" {
@@ -797,11 +1106,11 @@ test "toolbar floats whole over a short continuation row with reactions" {
     t.moveTo(r.x + 40, r.y + 8);
     for (0..3) |_| t.frame();
     try t.screenshot("/tmp/lax-toolbar-cont.png");
-    const reply = t.findText("Reply").?;
+    const reply = findLast(&t, "💬").?;
     // The bar sits over the row's top edge, fully inside the window
     try std.testing.expect(reply.y >= 0);
     try std.testing.expect(reply.y < r.y);
-    try t.clickText("Reply");
+    try clickLast(&t, "💬");
     for (0..2) |_| t.frame();
     try std.testing.expectEqual(@as(usize, 1), fake.thread_calls);
 }

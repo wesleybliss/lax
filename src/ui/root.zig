@@ -9,11 +9,15 @@ pub const attachments = @import("attachments.zig");
 pub const open_url = @import("open_url.zig");
 pub const layout = @import("layout.zig");
 pub const settings = @import("settings.zig");
+pub const message_menu = @import("message_menu.zig");
+pub const recents = @import("recents.zig");
 
 test {
     _ = open_url;
     _ = layout;
     _ = settings;
+    _ = message_menu;
+    _ = recents;
     _ = theme;
     _ = composer;
     _ = attachments;

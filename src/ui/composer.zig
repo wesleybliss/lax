@@ -60,6 +60,8 @@ pub const Composer = struct {
     /// Trigger position the user dismissed with Escape, plus one
     dismissed: usize = 0,
     mentions: std.ArrayList(Mention) = .empty,
+    /// Take the keyboard once the text area exists (it does after the next frame)
+    want_focus: bool = false,
 
     pub fn init(gpa: std.mem.Allocator) Composer {
         return .{ .gpa = gpa };
@@ -89,6 +91,75 @@ pub const Composer = struct {
 
     pub fn text(k: *const Composer) []const u8 {
         return k.buf.text();
+    }
+
+    /// Fills the box with a message to edit and focuses it. Mentions and
+    /// channels become what you type (`@name`, `#channel`), remembered so
+    /// they go back as Slack's tokens; the `&amp; &lt; &gt;` escapes are undone.
+    pub fn load(k: *Composer, st: *store.Store, raw: []const u8) void {
+        k.clear();
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(k.gpa);
+        var i: usize = 0;
+        while (i < raw.len) {
+            if (raw[i] == '<') {
+                if (std.mem.indexOfScalarPos(u8, raw, i, '>')) |j| {
+                    if (k.loadToken(st, &out, raw[i .. j + 1])) {
+                        i = j + 1;
+                        continue;
+                    }
+                    out.appendSlice(k.gpa, raw[i .. j + 1]) catch return;
+                    i = j + 1;
+                    continue;
+                }
+            }
+            const entities = [_]struct { []const u8, u8 }{ .{ "&amp;", '&' }, .{ "&lt;", '<' }, .{ "&gt;", '>' } };
+            const decoded = for (entities) |e| {
+                if (std.mem.startsWith(u8, raw[i..], e[0])) {
+                    out.append(k.gpa, e[1]) catch return;
+                    i += e[0].len;
+                    break true;
+                }
+            } else false;
+            if (decoded) continue;
+            out.append(k.gpa, raw[i]) catch return;
+            i += 1;
+        }
+        k.buf.set(out.items);
+        k.caret = out.items.len;
+        k.want_focus = true;
+    }
+
+    /// A `<@U1>`, `<#C1|name>` or `<!here>` as typed text; false for any other `<...>`
+    fn loadToken(k: *Composer, st: *store.Store, out: *std.ArrayList(u8), tok: []const u8) bool {
+        const inner = tok[1 .. tok.len - 1];
+        const bar = std.mem.indexOfScalar(u8, inner, '|');
+        const head = if (bar) |b| inner[0..b] else inner;
+        const label = if (bar) |b| inner[b + 1 ..] else "";
+        var shown: []const u8 = undefined;
+        var buf: [96]u8 = undefined;
+        if (head.len > 1 and head[0] == '@') {
+            const name = st.userName(head[1..]) orelse return false;
+            shown = std.fmt.bufPrint(&buf, "@{s}", .{name}) catch return false;
+        } else if (head.len > 1 and head[0] == '#') {
+            const name = if (st.channel(head[1..])) |c| c.name else label;
+            if (name.len == 0) return false;
+            shown = std.fmt.bufPrint(&buf, "#{s}", .{name}) catch return false;
+        } else if (std.mem.eql(u8, head, "!here") or std.mem.eql(u8, head, "!channel") or std.mem.eql(u8, head, "!everyone")) {
+            shown = std.fmt.bufPrint(&buf, "@{s}", .{head[1..]}) catch return false;
+        } else return false;
+        out.appendSlice(k.gpa, shown) catch return false;
+        for (k.mentions.items) |m| if (std.mem.eql(u8, m.shown, shown)) return true;
+        const sh = k.gpa.dupe(u8, shown) catch return true;
+        const tk = k.gpa.dupe(u8, tok) catch {
+            k.gpa.free(sh);
+            return true;
+        };
+        k.mentions.append(k.gpa, .{ .shown = sh, .token = tk }) catch {
+            k.gpa.free(sh);
+            k.gpa.free(tk);
+        };
+        return true;
     }
 
     fn isSpace(ch: u8) bool {
@@ -208,7 +279,7 @@ pub const Composer = struct {
     }
 
     /// The text with picked mentions in Slack's form
-    fn expand(k: *const Composer, arena: std.mem.Allocator, input: []const u8) []const u8 {
+    pub fn expand(k: *const Composer, arena: std.mem.Allocator, input: []const u8) []const u8 {
         var out: []const u8 = input;
         for (k.mentions.items) |m| {
             out = std.mem.replaceOwned(u8, arena, out, m.shown, m.token) catch return out;
@@ -268,6 +339,11 @@ pub const Composer = struct {
             .submit_on_return = items.len == 0 or k.dismissed != 0,
         });
         k.caret = res.caret;
+        if (k.want_focus) {
+            k.want_focus = false;
+            c.focus = k.buf.last_id;
+            c.changed = true;
+        }
         var out: Result = .{ .changed = res.changed, .rect = box_it.rect };
         if (res.submitted) {
             const trimmed = std.mem.trim(u8, k.buf.text(), " \t\r\n");
@@ -309,4 +385,19 @@ test "detect finds the word being completed" {
     try std.testing.expect(Composer.detect(":smile: ", 8) == null);
     try std.testing.expect(Composer.detect("#gen", 4).?.kind == .channel);
     try std.testing.expect(Composer.detect("done ", 5) == null);
+}
+
+test "load: mentions become names and go back as tokens, escapes are undone" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    try st.apply(.{ .users = &.{.{ .id = "U2", .name = "Grace" }} });
+    try st.apply(.{ .channels = &.{.{ .id = "C2", .name = "dev", .kind = .channel }} });
+    var k = Composer.init(gpa);
+    defer k.deinit();
+    k.load(&st, "hi <@U2> in <#C2|dev> &amp; <https://x.dev|link> &lt;3 <@UNKNOWN> <!here>");
+    try std.testing.expectEqualStrings("hi @Grace in #dev & <https://x.dev|link> <3 <@UNKNOWN> @here", k.text());
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    try std.testing.expectEqualStrings("hi <@U2> in <#C2|dev> & <https://x.dev|link> <3 <@UNKNOWN> <!here>", k.expand(arena.allocator(), k.text()));
 }

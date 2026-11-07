@@ -13,6 +13,8 @@ const composer_mod = @import("composer.zig");
 const attachments = @import("attachments.zig");
 const layout_mod = @import("layout.zig");
 const settings_mod = @import("settings.zig");
+const message_menu = @import("message_menu.zig");
+const recents_mod = @import("recents.zig");
 
 const mrkdwn = slack.mrkdwn;
 
@@ -49,7 +51,9 @@ const file_gap: f32 = 6;
 const file_chip_h: f32 = 36;
 /// Largest an image preview is drawn
 const file_max: f32 = 300;
-const quick_reactions = [_][]const u8{ "+1", "heart", "tada" };
+/// Hover toolbar: its buttons, and how many recent emoji it shows
+const bar_btn: f32 = 30;
+const bar_recent = 3;
 
 /// What the UI asks of the network side
 pub const Actions = struct {
@@ -61,6 +65,11 @@ pub const Actions = struct {
     older: *const fn (ctx: *anyopaque, channel: []const u8, before: []const u8) void,
     open_thread: *const fn (ctx: *anyopaque, channel: []const u8, ts: []const u8) void,
     react: *const fn (ctx: *anyopaque, channel: []const u8, ts: []const u8, name: []const u8, add: bool) void,
+    /// Replace the text of one of our messages
+    edit: *const fn (ctx: *anyopaque, channel: []const u8, ts: []const u8, text: []const u8) void,
+    delete: *const fn (ctx: *anyopaque, channel: []const u8, ts: []const u8) void,
+    /// Add a message to Saved
+    save: *const fn (ctx: *anyopaque, channel: []const u8, ts: []const u8) void,
     typing: *const fn (ctx: *anyopaque, channel: []const u8) void,
     mark: *const fn (ctx: *anyopaque, channel: []const u8, ts: []const u8) void,
     switch_team: *const fn (ctx: *anyopaque, team_id: []const u8) void,
@@ -90,6 +99,21 @@ const Tm = extern struct {
     zone: ?[*:0]const u8,
 };
 extern "c" fn localtime_r(t: *const i64, out: *Tm) ?*Tm;
+
+/// The ts one microsecond before `ts`: read up to it leaves that message unread
+fn tsBefore(buf: []u8, ts: []const u8) ?[]const u8 {
+    const dot = std.mem.indexOfScalar(u8, ts, '.') orelse return null;
+    var secs = std.fmt.parseInt(u64, ts[0..dot], 10) catch return null;
+    var micros = std.fmt.parseInt(u64, ts[dot + 1 ..], 10) catch return null;
+    if (micros > 0) {
+        micros -= 1;
+    } else {
+        if (secs == 0) return null;
+        secs -= 1;
+        micros = 999_999;
+    }
+    return std.fmt.bufPrint(buf, "{d}.{d:0>6}", .{ secs, micros }) catch null;
+}
 
 fn tsSeconds(ts: []const u8) i64 {
     const dot = std.mem.indexOfScalar(u8, ts, '.') orelse ts.len;
@@ -233,14 +257,20 @@ pub const State = struct {
     older_pending: bool = false,
     thread_composer: composer_mod.Composer,
     last_typing_ms: i64 = 0,
-    /// Message the pointer is over (ts), for its toolbar
-    hover_ts: [32]u8 = undefined,
-    hover_len: usize = 0,
+    /// The toolbar's emoji picker, overflow menu, forward list and delete prompt
+    menu: message_menu.Menu,
+    /// The emoji reacted with last
+    recents: recents_mod.Recents = .{},
+    /// Brief confirmations ("Link copied")
+    toaster: kit.Toaster,
+    /// The message being edited (in place of the message box that would send it)
+    editing: ?message_menu.Target = null,
+    edit_composer: composer_mod.Composer,
     /// Opens a link; replaced in tests
     opener: *const fn (gpa: std.mem.Allocator, io: std.Io, url: []const u8) void = open_url.open,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, st: *store.Store, actions: Actions) State {
-        return .{ .gpa = gpa, .io = io, .store = st, .actions = actions, .list = .{ .gpa = gpa }, .main_composer = .init(gpa), .thread_composer = .init(gpa), .main_attach = .init(gpa), .thread_attach = .init(gpa), .settings_arena = .init(gpa), .themes_arena = .init(gpa) };
+        return .{ .gpa = gpa, .io = io, .store = st, .actions = actions, .list = .{ .gpa = gpa }, .main_composer = .init(gpa), .thread_composer = .init(gpa), .main_attach = .init(gpa), .thread_attach = .init(gpa), .settings_arena = .init(gpa), .themes_arena = .init(gpa), .menu = .init(gpa), .toaster = .{ .gpa = gpa }, .edit_composer = .init(gpa) };
     }
 
     pub fn deinit(s: *State) void {
@@ -255,6 +285,9 @@ pub const State = struct {
         s.manual_token.deinit();
         s.manual_cookie.deinit();
         s.thread_composer.deinit();
+        s.edit_composer.deinit();
+        s.menu.deinit();
+        s.toaster.deinit();
         s.settings_arena.deinit();
         s.themes_arena.deinit();
         if (s.font_names) |names| {
@@ -281,6 +314,8 @@ pub const State = struct {
         s.list_rev = 0;
         s.older_pending = false;
         s.store.closeThread();
+        s.cancelEdit();
+        s.menu.closeAll();
         s.dropImages();
         if (s.store.channel(id)) |c| c.unread = false;
         s.actions.open(s.actions.ctx, id);
@@ -319,7 +354,7 @@ pub const State = struct {
     }
 
     fn resolveChannel(ctx: *const anyopaque, id: []const u8) ?[]const u8 {
-        const st: *store.Store = @constCast(@ptrCast(@alignCast(ctx)));
+        const st: *store.Store = @ptrCast(@alignCast(@constCast(ctx)));
         const c = st.channel(id) orelse return null;
         return c.name;
     }
@@ -398,6 +433,7 @@ pub const State = struct {
         s.manual_busy = false;
         s.pickInitial();
         s.cur = if (s.selected) |id| s.store.channel(id) else null;
+        if (s.editing) |e| if (s.findMessage(e) == null) s.cancelEdit();
         if (s.cur) |cur| if (cur.rev != s.list_rev) {
             s.list_rev = cur.rev;
             s.list.reset();
@@ -427,6 +463,8 @@ pub const State = struct {
             ui.div(c).w(1).hFull().bg(c.theme.border).end();
             s.threadPanel(c);
         }
+        s.messageOverlays(c);
+        s.toaster.view(c);
 
         defer s.pending_thread = null;
         if (s.pending_select) |id| {
@@ -469,6 +507,8 @@ pub const State = struct {
         s.list_rev = 0;
         s.main_composer.clear();
         s.main_attach.clear();
+        s.cancelEdit();
+        s.menu.closeAll();
         s.dropImages();
         // The command-line channel only makes sense for the first workspace
         s.preferred = null;
@@ -747,9 +787,9 @@ pub const State = struct {
         {
             const row = s.settingRow(c, "Mode");
             defer row.end();
-            var picked: usize = @intFromEnum(s.settings.appearance);
+            var picked: usize = @backingInt(s.settings.appearance);
             if (kit.tabs(c, &.{ "System", "Light", "Dark" }, &picked, .{ .variant = .segmented })) {
-                s.settings.appearance = @enumFromInt(picked);
+                s.settings.appearance = @fromBackingInt(@intCast(picked));
                 changed = true;
             }
             if (s.settings.appearance == .system) ui.text(c, if (s.system_dark) "Your desktop is dark" else "Your desktop is light", .{ .size = 13, .color = c.theme.muted });
@@ -1074,7 +1114,7 @@ pub const State = struct {
         }
         ui.divider(c);
         const kind = s.top_view.feed() orelse return s.centered(c, "Coming soon");
-        const idx = @intFromEnum(kind);
+        const idx = @backingInt(kind);
         const now = store.nowMs(s.io);
         if (s.feed_asked_ms[idx] == 0 or now - s.feed_asked_ms[idx] > feed_refresh_ms) {
             s.feed_asked_ms[idx] = now;
@@ -1358,7 +1398,7 @@ pub const State = struct {
             if (!in_thread and m.reply_count > 0) s.replyLink(c, m, channel_id);
         }
 
-        if (hovered) if (row_it.rect) |rect| s.toolbar(c, rect, m, channel_id, in_thread);
+        if (hovered or s.menu.holdsToolbar(channel_id, m.ts, in_thread)) if (row_it.rect) |rect| s.toolbar(c, rect, m, channel_id, in_thread);
     }
 
     /// An attached file: an image's preview under its name, anything else as
@@ -1418,7 +1458,7 @@ pub const State = struct {
             if (r.mine) pill = pill.border(s.pal.link).borderW(1);
             pill = pill.hover(if (r.mine) s.pal.primary_container else c.theme.surface_hover);
             defer pill.end();
-            if (pill.clicked()) s.actions.react(s.actions.ctx, channel_id, m.ts, r.name, !r.mine);
+            if (pill.clicked()) s.react(channel_id, m.ts, r.name, !r.mine);
             ui.text(c, label, .{ .size = 13, .color = if (r.mine) s.pal.on_primary_container else c.theme.text });
         }
     }
@@ -1437,28 +1477,205 @@ pub const State = struct {
         s.actions.open_thread(s.actions.ctx, channel_id, ts);
     }
 
-    /// Quick reactions and Reply, on a layer over the messages at the row's
-    /// top right (a row clips what it holds, and a short row is shorter than
-    /// the bar)
+    /// Slack's hover toolbar, on a layer over the messages at the row's top
+    /// right (a row clips what it holds, and a short row is shorter than the
+    /// bar): the last three emoji, the emoji picker, reply in thread (not
+    /// inside a thread), reply (a DM only: forwards to that DM), forward, and
+    /// the overflow menu
     fn toolbar(s: *State, c: *ui.Context, rect: ui.Rect, m: *const store.Message, channel_id: []const u8, in_thread: bool) void {
-        const bar_w: f32 = 28 * quick_reactions.len + (if (in_thread) @as(f32, 0) else 64) + 12;
+        var names: [recents_mod.max + recents_mod.defaults.len][]const u8 = undefined;
+        const n_names = s.recents.top(&names);
+        var shown: [bar_recent][]const u8 = undefined;
+        var n_shown: usize = 0;
+        for (names[0..n_names]) |name| {
+            if (n_shown == bar_recent) break;
+            if (slack.emoji.lookup(name) == null) continue;
+            shown[n_shown] = name;
+            n_shown += 1;
+        }
+        const is_dm = if (s.store.channel(channel_id)) |ch| ch.kind == .im else false;
+        const count: f32 = @floatFromInt(n_shown + 3 + @intFromBool(!in_thread) + @intFromBool(is_dm));
+        const bar_w = bar_btn * count + 2 * (count - 1) + 12;
         const x = @max(rect.x, rect.x + rect.w - bar_w - 16);
-        const y = @max(4, rect.y - 12);
-        const bar = ui.div(c).row().fixed().offset(x, y).layer(20).w(bar_w).h(32).itemsCenter().justifyCenter().gap(2).rounded(16).bg(s.pal.container_high).border(c.theme.border).borderW(1).shadow(.{ .color = c.theme.border.alpha(0.6), .blur = 8, .y = 2 });
+        const y = @max(4, rect.y - 16);
+        const bar = ui.div(c).row().fixed().offset(x, y).layer(20).w(bar_w).h(bar_btn + 4).itemsCenter().justifyCenter().gap(2).rounded(12).bg(s.pal.container_high).border(c.theme.border).borderW(1).shadow(.{ .color = c.theme.border.alpha(0.6), .blur = 8, .y = 2 });
         defer bar.end();
-        for (quick_reactions) |name| {
-            const glyph = slack.emoji.lookup(name) orelse continue;
-            const btn = ui.div(c).w(28).h(28).center().roundedFull().circular().control().hover(c.theme.surface_hover);
+        const target = message_menu.Target.make(channel_id, m.ts, in_thread);
+        for (shown[0..n_shown]) |name| {
+            const btn = barButton(c);
             defer btn.end();
-            if (btn.clicked()) s.actions.react(s.actions.ctx, channel_id, m.ts, name, !hasMine(m, name));
-            ui.text(c, glyph, .{ .size = 16 });
+            if (btn.clicked()) s.react(channel_id, m.ts, name, !hasMine(m, name));
+            ui.text(c, slack.emoji.lookup(name).?, .{ .size = 17 });
         }
+        if (s.barIcon(c, "🙂", "Add reaction")) |at| s.toggleMenu(.picker, target, at);
         if (!in_thread) {
-            const btn = ui.div(c).h(28).px(10).center().roundedFull().circular().control().hover(c.theme.surface_hover);
-            defer btn.end();
-            if (btn.clicked()) s.openThread(channel_id, m.ts);
-            ui.text(c, "Reply", .{ .size = 13, .weight = .semibold, .color = s.pal.link });
+            if (s.barIcon(c, "💬", "Reply in thread")) |_| s.openThread(channel_id, m.ts);
         }
+        if (is_dm) {
+            if (s.barIcon(c, "arrowshape.turn.up.left", "Reply")) |_| s.forwardTo(c, channel_id, m, channel_id);
+        }
+        if (s.barIcon(c, "arrow.right", "Forward message")) |at| s.toggleMenu(.forward, target, at);
+        if (s.barIcon(c, "⋮", "More actions")) |at| s.toggleMenu(.menu, target, at);
+    }
+
+    fn barButton(c: *ui.Context) ui.Div {
+        return ui.div(c).w(bar_btn).h(bar_btn).center().rounded(8).control().hover(c.theme.surface_hover);
+    }
+
+    /// A toolbar button with a tooltip; where it is, when clicked. `look` is
+    /// an emoji, or an SF Symbol name when it starts with a letter.
+    fn barIcon(s: *State, c: *ui.Context, look: []const u8, tip: []const u8) ?ui.Rect {
+        const btn = barButton(c);
+        defer btn.end();
+        const it = btn.interaction();
+        kit.tooltip(c, it, tip, .{});
+        if (std.ascii.isAlphabetic(look[0])) {
+            ui.icon(c, look, .{ .size = 16, .frame = 20, .weight = .semibold, .color = s.pal.on_primary_container });
+        } else ui.text(c, look, .{ .size = 17 });
+        if (!btn.clicked()) return null;
+        return it.rect orelse ui.Rect{ .x = 0, .y = 0, .w = 0, .h = 0 };
+    }
+
+    /// Opens a toolbar popup by `anchor`, or closes it if it is that one already
+    fn toggleMenu(s: *State, which: message_menu.Which, target: message_menu.Target, anchor: ui.Rect) void {
+        if (s.menu.isOpen(which, target)) return s.menu.closeAll();
+        s.menu.show(which, target, anchor);
+    }
+
+    /// Adds or removes our reaction, and remembers the emoji for the toolbar
+    fn react(s: *State, channel_id: []const u8, ts: []const u8, name: []const u8, add: bool) void {
+        s.actions.react(s.actions.ctx, channel_id, ts, name, add);
+        if (!add) return;
+        s.recents.push(name);
+        if (s.layout_dir) |dir| s.recents.save(s.gpa, s.io, dir);
+    }
+
+    /// The message a toolbar popup or an edit is about, if it is still there
+    fn findMessage(s: *State, t: message_menu.Target) ?*const store.Message {
+        const items: []const store.Message = if (t.in_thread) blk: {
+            const th = &(s.store.thread orelse return null);
+            break :blk if (std.mem.eql(u8, th.channel, t.channel())) th.messages.items else return null;
+        } else (s.store.channel(t.channel()) orelse return null).messages.items;
+        for (items) |*m| if (std.mem.eql(u8, m.ts, t.ts())) return m;
+        return null;
+    }
+
+    fn isMine(s: *const State, m: *const store.Message) bool {
+        const u = m.user orelse return false;
+        return s.store.self_id.len > 0 and std.mem.eql(u8, u, s.store.self_id);
+    }
+
+    /// Draws the open toolbar popup (if any) and acts on what it chose
+    fn messageOverlays(s: *State, c: *ui.Context) void {
+        var info: message_menu.Info = .{ .own = false, .preview = "" };
+        if (s.menu.anyOpen()) {
+            if (s.findMessage(s.menu.target)) |m| {
+                const r = mrkdwn.render(c.alloc(), m.text, s.resolver()) catch mrkdwn.Rendered{ .text = m.text, .runs = &.{} };
+                info = .{ .own = s.isMine(m), .preview = r.text };
+            } else s.menu.closeAll();
+        }
+        const choice = s.menu.draw(c, s.store, s.pal, info) orelse return;
+        s.applyChoice(c, choice);
+    }
+
+    /// Sends a link to the message into the `dest` conversation
+    fn forwardTo(s: *State, c: *ui.Context, channel_id: []const u8, m: *const store.Message, dest: []const u8) void {
+        const link = s.permalink(c.alloc(), channel_id, m) orelse return;
+        s.actions.send(s.actions.ctx, dest, link, null);
+        s.toast("Message forwarded");
+    }
+
+    fn applyChoice(s: *State, c: *ui.Context, choice: message_menu.Choice) void {
+        const t = s.menu.target;
+        const m = s.findMessage(t) orelse return;
+        switch (choice) {
+            .react => |name| s.react(t.channel(), t.ts(), name, !hasMine(m, name)),
+            .forward => |dest| s.forwardTo(c, t.channel(), m, dest),
+            .confirm_delete => s.actions.delete(s.actions.ctx, t.channel(), t.ts()),
+            .action => |a| switch (a) {
+                .edit => s.beginEdit(t, m),
+                .mark_unread => {
+                    var buf: [32]u8 = undefined;
+                    const before = tsBefore(&buf, t.ts()) orelse return;
+                    s.actions.mark(s.actions.ctx, t.channel(), before);
+                    if (s.store.channel(t.channel())) |ch| ch.unread = true;
+                },
+                .save => {
+                    s.actions.save(s.actions.ctx, t.channel(), t.ts());
+                    s.toast("Added to saved");
+                },
+                .copy_link => {
+                    const link = s.permalink(c.alloc(), t.channel(), m) orelse return;
+                    c.clipboard.write(c.clipboard.ctx, link);
+                    s.toast("Link copied");
+                },
+                .copy_text => {
+                    const r = mrkdwn.render(c.alloc(), m.text, s.resolver()) catch return;
+                    c.clipboard.write(c.clipboard.ctx, r.text);
+                    s.toast("Message copied");
+                },
+                .delete => s.menu.show(.confirm_delete, t, null),
+            },
+        }
+    }
+
+    fn toast(s: *State, title: []const u8) void {
+        s.toaster.push(.{ .title = title, .duration = 2.5 });
+    }
+
+    /// The link Slack gives a message: `<workspace>/archives/<channel>/p<ts>`,
+    /// with its thread for a reply
+    fn permalink(s: *State, arena: std.mem.Allocator, channel_id: []const u8, m: *const store.Message) ?[]const u8 {
+        var base: []const u8 = "";
+        for (s.store.teams.items) |t| if (std.mem.eql(u8, t.id, s.store.active_team)) {
+            base = std.mem.trimEnd(u8, t.url, "/");
+        };
+        if (base.len == 0) return null;
+        const flat = arena.alloc(u8, m.ts.len) catch return null;
+        const dots = std.mem.replace(u8, m.ts, ".", "", flat);
+        const digits = flat[0 .. m.ts.len - dots];
+        const tail = if (m.thread_ts) |th| (if (std.mem.eql(u8, th, m.ts)) "" else std.fmt.allocPrint(arena, "?thread_ts={s}&cid={s}", .{ th, channel_id }) catch return null) else "";
+        return std.fmt.allocPrint(arena, "{s}/archives/{s}/p{s}{s}", .{ base, channel_id, digits, tail }) catch null;
+    }
+
+    // Editing
+
+    fn beginEdit(s: *State, t: message_menu.Target, m: *const store.Message) void {
+        s.edit_composer.load(s.store, m.text);
+        s.editing = t;
+    }
+
+    fn cancelEdit(s: *State) void {
+        if (s.editing == null) return;
+        s.editing = null;
+        s.edit_composer.clear();
+    }
+
+    /// The message box while editing: the text, Cancel and Save, until it is done
+    fn editBar(s: *State, c: *ui.Context, t: message_menu.Target, pad_x: f32) void {
+        const box = ui.div(c).column().wFull().px(pad_x).pb(16).pt(4).gap(8);
+        defer box.end();
+        {
+            const head = ui.div(c).row().itemsCenter().wFull();
+            defer head.end();
+            ui.text(c, "Editing message", .{ .size = 13, .weight = .semibold, .color = c.theme.muted });
+            ui.spacer(c);
+            ui.text(c, "Enter saves · Esc cancels", .{ .size = 12, .color = c.theme.muted });
+        }
+        const res = s.edit_composer.view(c, s.store, s.pal, .{ .placeholder = "Edit message", .max_lines = 8 });
+        const row = ui.div(c).row().wFull().gap(8).justifyEnd();
+        defer row.end();
+        const cancel = kit.button(c, "Cancel", .{}).clicked or c.shortcut(.{ .key = ui.Shortcut.escape });
+        const text = std.mem.trim(u8, s.edit_composer.text(), " \t\r\n");
+        const save = kit.button(c, "Save", .{ .variant = .primary, .disabled = text.len == 0 }).clicked;
+        if (cancel) return s.cancelEdit();
+        const out: ?[]const u8 = if (res.submitted) |sub| sub else if (save) s.edit_composer.expand(c.alloc(), text) else null;
+        const sent = out orelse return;
+        if (s.findMessage(t)) |m| {
+            const unchanged = std.mem.eql(u8, sent, m.text);
+            if (!unchanged and sent.len > 0) s.actions.edit(s.actions.ctx, t.channel(), t.ts(), sent);
+        }
+        s.cancelEdit();
     }
 
     fn hasMine(m: *const store.Message, name: []const u8) bool {
@@ -1489,6 +1706,7 @@ pub const State = struct {
             for (t.messages.items, 0..) |*m, i| s.drawMessage(c, m, hasHeaderIn(t.messages.items, i), null, t.channel, true);
             c.end();
         }
+        if (s.editing) |e| if (e.in_thread) return s.editBar(c, e, 16);
         s.thread_attach.view(c, s.pal);
         const bar = ui.div(c).row().wFull().px(16).py(12);
         defer bar.end();
@@ -1559,6 +1777,7 @@ pub const State = struct {
     }
 
     fn composer(s: *State, c: *ui.Context) void {
+        if (s.editing) |e| if (!e.in_thread) return s.editBar(c, e, 20);
         s.main_attach.view(c, s.pal);
         const bar = ui.div(c).row().wFull().px(20).pb(16);
         defer bar.end();
