@@ -37,3 +37,12 @@ family per window theme, fixed at window creation.
 - `ui/context.zig`: `family_override`, `mono_override`, `alt_override`, set by the view; they win over the theme's families and apply from the next frame.
 - `ui/frame.zig`: passes them to the text system.
 - `ui/text_tt.zig`: `alt_family`, `setAltFamily`, and `alt` in the font and layout cache keys. `ui/text_mac.zig` has a no-op `setAltFamily` (macOS keeps one family).
+
+## 4. Light and dark from the desktop's real setting, live (Linux)
+
+**Why:** `desktop.isDark()` only looked for "dark" in the `GTK_THEME` environment variable, which GNOME never sets, so a dark desktop always got the light theme, and a change at runtime was never noticed (frames run on input only).
+
+**What:**
+- `linux/desktop.zig`: `isDark()` asks GTK's settings: `gtk-interface-color-scheme` (GTK 4.20+, the settings portal's light or dark choice), then `gtk-application-prefer-dark-theme`, then a theme name containing "dark". `GTK_THEME`, when set, still decides alone.
+- `linux/gtk.zig`: `g_object_get`, `gtk_settings_get_default`, `gtk_get_minor_version` (GTK 4).
+- `linux/surface.zig`: `watchAppearance` connects to the settings' `notify::` signals for those properties and requests a frame; the handlers are disconnected in `destroy`. Not connected with a `theme_override`.

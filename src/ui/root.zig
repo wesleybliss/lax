@@ -13,6 +13,7 @@ test {
     _ = open_url;
     _ = layout;
     _ = settings;
+    _ = theme;
     _ = composer;
     _ = @import("tests.zig");
 }

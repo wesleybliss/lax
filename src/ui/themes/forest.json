@@ -1,0 +1,19 @@
+{
+    "id": "forest",
+    "name": "Forest",
+    "author": "Lax",
+    "description": "Calm greens and warm paper",
+    "light": {
+        "background": "#fafaf2",
+        "primary": "#2d6a30",
+        "secondary": "#6b7f5c",
+        "accent": "#8a5a00"
+    },
+    "dark": {
+        "background": "#11140f",
+        "text": "#e1e4da",
+        "primary": "#9fd89a",
+        "secondary": "#a8bd98",
+        "accent": "#f0bf5a"
+    }
+}

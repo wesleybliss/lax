@@ -194,6 +194,7 @@ test "message text selects across rows and copies" {
     try std.testing.expect(std.mem.indexOf(u8, copied, b.text[0..15]) != null);
 }
 
+const settings_mod = @import("settings.zig");
 const app_view = @import("app_view.zig");
 const store = @import("store");
 
@@ -1165,6 +1166,82 @@ test "account menu: avatar opens it, Settings opens the page, fonts and sizes ap
     try std.testing.expect(state.settings.chat_size > before);
     try std.testing.expectEqual(@as(f32, 1.1), t.ctx.text.zoom);
     try t.screenshot("/tmp/lax-settings-big.png");
+}
+
+test "appearance: follows the system, and a manual choice overrides it" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1, .dark = true });
+    defer t.deinit();
+    for (0..3) |_| t.frame();
+    // System: dark desktop, dark colors
+    try std.testing.expect(state.dark and state.system_dark and t.ctx.theme.dark);
+    try t.screenshot("/tmp/lax-theme-system-dark.png");
+    // Forced light over a dark desktop
+    state.applySettings(.{ .appearance = .light });
+    for (0..3) |_| t.frame();
+    try std.testing.expect(!state.dark and state.system_dark and !t.ctx.theme.dark);
+    try std.testing.expect(t.ctx.theme.background.r > 0.9);
+    // Back to the system
+    state.applySettings(.{});
+    for (0..3) |_| t.frame();
+    try std.testing.expect(state.dark and t.ctx.theme.background.r < 0.2);
+    // The account menu's toggle flips what is shown and keeps it
+    t.click(38, 640 - 16 - 26);
+    for (0..3) |_| t.frame();
+    try t.clickText("Light mode");
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqual(settings_mod.Appearance.light, state.settings.appearance);
+    try std.testing.expect(!state.dark);
+    t.click(38, 640 - 16 - 26);
+    for (0..3) |_| t.frame();
+    try std.testing.expect(t.hasText("Dark mode"));
+}
+
+test "themes: pick one in Settings, colors follow, light and dark both" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 760, .scale = 1 });
+    defer t.deinit();
+    for (0..3) |_| t.frame();
+    const base_accent = t.ctx.theme.accent;
+    state.settings_open = true;
+    for (0..3) |_| t.frame();
+    try std.testing.expect(t.hasText("Ocean") and t.hasText("Forest"));
+    try t.screenshot("/tmp/lax-theme-settings-light.png");
+    try t.clickText("Ocean");
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqualStrings("ocean", state.settings.theme);
+    try std.testing.expect(!std.meta.eql(base_accent, t.ctx.theme.accent));
+    // The segmented control forces dark; the theme stays
+    try t.clickText("Dark");
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqual(settings_mod.Appearance.dark, state.settings.appearance);
+    try std.testing.expect(state.dark);
+    try std.testing.expectEqualStrings("ocean", state.settings.theme);
+    try t.screenshot("/tmp/lax-theme-settings-dark.png");
+    state.settings_open = false;
+    for (0..3) |_| t.frame();
+    try t.screenshot("/tmp/lax-theme-chat-ocean-dark.png");
+    state.applySettings(.{ .theme = "rose", .appearance = .light });
+    for (0..3) |_| t.frame();
+    try t.screenshot("/tmp/lax-theme-chat-rose-light.png");
+    state.applySettings(.{ .theme = "ocean", .appearance = .dark });
+    for (0..3) |_| t.frame();
+    // An unknown theme id falls back to the default
+    state.applySettings(.{ .theme = "gone" });
+    for (0..3) |_| t.frame();
+    try std.testing.expect(std.meta.eql(t.ctx.theme.accent, base_accent));
 }
 
 test "fonts: the chat font changes message text only, and a bad name falls back" {

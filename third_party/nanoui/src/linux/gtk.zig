@@ -30,6 +30,7 @@ pub const Api = struct {
     g_main_loop_quit: *const fn (loop: *anyopaque) callconv(.c) void,
     g_main_loop_unref: *const fn (loop: *anyopaque) callconv(.c) void,
     g_free: *const fn (ptr: ?*anyopaque) callconv(.c) void,
+    g_object_get: *const fn (obj: *anyopaque, first_property: [*:0]const u8, ...) callconv(.c) void,
     g_object_unref: *const fn (obj: *anyopaque) callconv(.c) void,
     g_object_ref_sink: *const fn (obj: *anyopaque) callconv(.c) *anyopaque,
     g_object_new: *const fn (kind: usize, first_property: ?[*:0]const u8, ...) callconv(.c) ?*anyopaque,
@@ -37,6 +38,7 @@ pub const Api = struct {
     g_memory_input_stream_new_from_data: *const fn (data: [*]const u8, len: isize, destroy: ?*anyopaque) callconv(.c) *anyopaque,
     g_slist_free: *const fn (list: ?*anyopaque) callconv(.c) void,
     // GTK, the same in 3 and 4.
+    gtk_settings_get_default: *const fn () callconv(.c) ?*anyopaque,
     gtk_window_set_title: *const fn (w: *Widget, title: [*:0]const u8) callconv(.c) void,
     gtk_window_set_default_size: *const fn (w: *Widget, width: c_int, height: c_int) callconv(.c) void,
     gtk_window_set_resizable: *const fn (w: *Widget, on: c_int) callconv(.c) void,
@@ -140,6 +142,7 @@ pub const Api3 = struct {
 /// GTK 4's own: one child per window, event controllers instead of event
 /// signals, a draw function, and a clipboard and dialogs that answer later.
 pub const Api4 = struct {
+    gtk_get_minor_version: *const fn () callconv(.c) c_uint,
     gtk_init_check: *const fn () callconv(.c) c_int,
     gtk_window_new: *const fn () callconv(.c) *Widget,
     gtk_window_set_child: *const fn (w: *Widget, child: ?*Widget) callconv(.c) void,

@@ -162,6 +162,13 @@ pub const State = struct {
     marked_ts: []u8 = &.{},
     pending_select: ?[]const u8 = null,
     pal: theme.Palette = undefined,
+    /// The color themes: built in, then the user's (loaded on first use)
+    themes: []const theme.Def = &.{},
+    /// Owns `themes`
+    themes_arena: std.heap.ArenaAllocator,
+    /// The desktop asks for dark, and the colors in use are dark (this frame)
+    system_dark: bool = false,
+    dark: bool = false,
     /// The store's epoch this state was built for
     epoch: u32 = 0,
     pending_team: ?[]const u8 = null,
@@ -217,7 +224,7 @@ pub const State = struct {
     opener: *const fn (gpa: std.mem.Allocator, io: std.Io, url: []const u8) void = open_url.open,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, st: *store.Store, actions: Actions) State {
-        return .{ .gpa = gpa, .io = io, .store = st, .actions = actions, .list = .{ .gpa = gpa }, .main_composer = .init(gpa), .thread_composer = .init(gpa), .settings_arena = .init(gpa) };
+        return .{ .gpa = gpa, .io = io, .store = st, .actions = actions, .list = .{ .gpa = gpa }, .main_composer = .init(gpa), .thread_composer = .init(gpa), .settings_arena = .init(gpa), .themes_arena = .init(gpa) };
     }
 
     pub fn deinit(s: *State) void {
@@ -228,6 +235,7 @@ pub const State = struct {
         s.manual_cookie.deinit();
         s.thread_composer.deinit();
         s.settings_arena.deinit();
+        s.themes_arena.deinit();
         if (s.font_names) |names| {
             for (names) |n| s.gpa.free(n);
             s.gpa.free(names);
@@ -344,7 +352,7 @@ pub const State = struct {
     // View
 
     pub fn view(s: *State, c: *ui.Context) void {
-        s.pal = theme.apply(c);
+        s.applyTheme(c);
         s.applyFonts(c);
         s.trackLayout(c);
         if (s.epoch != s.store.epoch) s.forgetWorkspace();
@@ -491,7 +499,13 @@ pub const State = struct {
             s.openTeamPage(c, "team/", s.store.self_id);
             s.user_menu_open = false;
         }
+        if (s.menuRow(c, if (s.dark) "Light mode" else "Dark mode", "")) {
+            s.settings.appearance = if (s.dark) .light else .dark;
+            s.saveSettings();
+            s.user_menu_open = false;
+        }
         if (s.menuRow(c, "Settings", "")) {
+            s.loadThemes();
             s.settings_open = true;
             s.user_menu_open = false;
         }
@@ -578,6 +592,7 @@ pub const State = struct {
         var next = new.clamped();
         next.ui_font = a.dupe(u8, new.ui_font) catch "";
         next.chat_font = a.dupe(u8, new.chat_font) catch "";
+        next.theme = a.dupe(u8, new.theme) catch "";
         s.settings = next;
     }
 
@@ -585,15 +600,47 @@ pub const State = struct {
         if (s.layout_dir) |dir| settings_mod.save(s.gpa, s.io, dir, s.settings);
     }
 
-    /// Hands the chosen fonts and zoom to nanoui; they take effect next frame
+    /// (Re)reads the themes: the built-in ones and those in the config dir
+    fn loadThemes(s: *State) void {
+        // The fonts applied last frame may be strings of the old themes
+        const keep = s.settings_arena.allocator();
+        s.applied_ui_font = keep.dupe(u8, s.applied_ui_font) catch "";
+        s.applied_chat_font = keep.dupe(u8, s.applied_chat_font) catch "";
+        _ = s.themes_arena.reset(.free_all);
+        s.themes = theme.loadAll(s.themes_arena.allocator(), s.io, s.layout_dir);
+    }
+
+    /// The theme the settings choose (the default for an unknown id)
+    fn activeTheme(s: *State) ?*const theme.Def {
+        return theme.find(s.themes, s.settings.theme) orelse theme.find(s.themes, theme.default_id);
+    }
+
+    /// Sets this frame's colors: the theme in light or dark, which follows
+    /// the desktop (nanoui's own theme this frame) unless Settings force one
+    fn applyTheme(s: *State, c: *ui.Context) void {
+        if (s.themes.len == 0) s.loadThemes();
+        s.system_dark = c.theme.dark;
+        s.dark = switch (s.settings.appearance) {
+            .system => s.system_dark,
+            .light => false,
+            .dark => true,
+        };
+        s.pal = theme.apply(c, theme.resolve(s.activeTheme(), s.dark));
+    }
+
+    /// Hands the chosen fonts and zoom to nanoui; they take effect next
+    /// frame. A theme's fonts apply where Settings choose none.
     fn applyFonts(s: *State, c: *ui.Context) void {
-        const ui_font: ?[]const u8 = if (s.settings.ui_font.len > 0) s.settings.ui_font else null;
-        const chat_font: ?[]const u8 = if (s.settings.chat_font.len > 0) s.settings.chat_font else null;
-        if (!std.mem.eql(u8, s.applied_ui_font, s.settings.ui_font) or !std.mem.eql(u8, s.applied_chat_font, s.settings.chat_font)) {
+        const fonts = if (s.activeTheme()) |d| d.fonts else theme.Fonts{};
+        const want_ui = if (s.settings.ui_font.len > 0) s.settings.ui_font else fonts.ui;
+        const want_chat = if (s.settings.chat_font.len > 0) s.settings.chat_font else fonts.chat;
+        const ui_font: ?[]const u8 = if (want_ui.len > 0) want_ui else null;
+        const chat_font: ?[]const u8 = if (want_chat.len > 0) want_chat else null;
+        if (!std.mem.eql(u8, s.applied_ui_font, want_ui) or !std.mem.eql(u8, s.applied_chat_font, want_chat)) {
             c.family_override = ui_font;
             c.alt_override = chat_font;
-            s.applied_ui_font = s.settings.ui_font;
-            s.applied_chat_font = s.settings.chat_font;
+            s.applied_ui_font = want_ui;
+            s.applied_chat_font = want_chat;
             s.list.reset();
             c.changed = true;
         }
@@ -651,6 +698,30 @@ pub const State = struct {
         defer body.end();
         var changed = false;
 
+        ui.text(c, "Appearance", .{ .size = 16, .weight = .bold });
+        {
+            const row = s.settingRow(c, "Mode");
+            defer row.end();
+            var picked: usize = @intFromEnum(s.settings.appearance);
+            if (kit.tabs(c, &.{ "System", "Light", "Dark" }, &picked, .{ .variant = .segmented })) {
+                s.settings.appearance = @enumFromInt(picked);
+                changed = true;
+            }
+            if (s.settings.appearance == .system) ui.text(c, if (s.system_dark) "Your desktop is dark" else "Your desktop is light", .{ .size = 13, .color = c.theme.muted });
+        }
+        {
+            const row = ui.div(c).row().gap(16).wFull();
+            defer row.end();
+            const lab = ui.div(c).row().w(120).h(44).itemsCenter();
+            ui.text(c, "Theme", .{ .size = 14, .color = c.theme.muted });
+            lab.end();
+            if (s.themeGrid(c)) |id| {
+                s.settings.theme = s.settings_arena.allocator().dupe(u8, id) catch "";
+                changed = true;
+            }
+        }
+
+        ui.div(c).h(8).end();
         ui.text(c, "Interface", .{ .size = 16, .weight = .bold });
         {
             const row = s.settingRow(c, "Font");
@@ -704,6 +775,41 @@ pub const State = struct {
             s.settings = s.settings.clamped();
             s.saveSettings();
         }
+    }
+
+    /// The themes as cards, three to a row; the id of the one clicked
+    fn themeGrid(s: *State, c: *ui.Context) ?[]const u8 {
+        var picked: ?[]const u8 = null;
+        const col = ui.div(c).column().gap(12);
+        defer col.end();
+        const current = if (s.activeTheme()) |d| d.id else theme.default_id;
+        var i: usize = 0;
+        while (i < s.themes.len) : (i += 3) {
+            const row = ui.div(c).row().gap(12);
+            defer row.end();
+            for (s.themes[i..@min(i + 3, s.themes.len)]) |*d| {
+                if (s.themeCard(c, d, std.mem.eql(u8, d.id, current))) picked = d.id;
+            }
+        }
+        return picked;
+    }
+
+    /// A theme's swatch in the current mode: its background, name and main colors
+    fn themeCard(s: *State, c: *ui.Context, d: *const theme.Def, selected: bool) bool {
+        const r = theme.resolve(d, s.dark);
+        ui.key(c, c.print("theme-{s}", .{d.id}));
+        var card = ui.div(c).column().w(136).h(84).p(12).gap(10).rounded(16).bg(r.theme.background).control();
+        card = if (selected) card.border(r.theme.accent).borderW(2) else card.border(c.theme.border).borderW(1);
+        defer card.end();
+        ui.text(c, if (d.name.len > 0) d.name else d.id, .{ .size = 14, .weight = .semibold, .color = r.theme.text, .truncate = .ellipsis });
+        {
+            const dots = ui.div(c).row().gap(6);
+            defer dots.end();
+            for ([_]ui.Color{ r.theme.accent, r.pal.secondary_container, r.pal.link, r.pal.container_high }) |color| {
+                ui.div(c).w(20).h(20).roundedFull().bg(color).border(r.theme.border).borderW(1).end();
+            }
+        }
+        return card.clicked();
     }
 
     /// A row with its label; the caller adds the control and ends the row

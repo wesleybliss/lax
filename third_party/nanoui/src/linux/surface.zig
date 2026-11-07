@@ -18,6 +18,7 @@ const text = @import("../ui/text.zig");
 const frame_mod = @import("../ui/frame.zig");
 const ctx_mod = @import("../ui/context.zig");
 const clock = @import("../ui/clock.zig");
+const desktop = @import("desktop.zig");
 const Theme = @import("../ui/theme.zig").Theme;
 const Context = ctx_mod.Context;
 const Window = @import("window.zig").Window;
@@ -54,6 +55,8 @@ pub const Surface = struct {
     /// A frame is being built, and another was asked for meanwhile.
     in_frame: bool = false,
     pending: bool = false,
+    /// The GTK settings handlers that watch light and dark
+    appearance_ids: [desktop.dark_properties.len]c_ulong = @splat(0),
 
     pub fn create(window: *Window, view: ui.View, theme_override: ?Theme) !*Surface {
         const gpa = window.app.gpa;
@@ -76,6 +79,7 @@ pub const Surface = struct {
             .start_time = clock.now(),
         };
         self.ctx = .init(gpa, &self.text);
+        self.watchAppearance();
         // No theme background under a transparent window's view.
         self.ctx.transparent_root = window.transparent != .none;
         if (gtk.v4) {
@@ -86,6 +90,22 @@ pub const Surface = struct {
         gtk.connect(self.im, "commit", @ptrCast(&onCommit), self);
         gtk.v3.gtk_container_add(window.gtkwindow.?, area);
         return self;
+    }
+
+    /// A frame when the desktop changes between light and dark.
+    fn watchAppearance(self: *Surface) void {
+        if (self.theme_override != null) return;
+        const settings = gtk.api.gtk_settings_get_default() orelse return;
+        for (desktop.dark_properties, 0..) |signal, i| {
+            // Only GTK 4.20 has the color scheme property
+            if (std.mem.indexOf(u8, std.mem.span(signal), "color-scheme") != null and !(gtk.v4 and gtk.v4api.gtk_get_minor_version() >= 20)) continue;
+            self.appearance_ids[i] = gtk.api.g_signal_connect_data(settings, signal, @ptrCast(&onAppearance), self, null, 0);
+        }
+    }
+
+    fn onAppearance(_: *anyopaque, _: ?*anyopaque, data: ?*anyopaque) callconv(.c) void {
+        const self: *Surface = @ptrCast(@alignCast(data));
+        self.requestFrame();
     }
 
     /// Feeds `area`'s events to the surface, and draws it (GTK 3).
@@ -109,6 +129,7 @@ pub const Surface = struct {
 
     pub fn destroy(self: *Surface) void {
         const g = &gtk.api;
+        if (g.gtk_settings_get_default()) |settings| for (self.appearance_ids) |id| if (id != 0) g.g_signal_handler_disconnect(settings, id);
         if (self.tick != 0) g.gtk_widget_remove_tick_callback(self.area, self.tick);
         if (self.idle != 0) _ = g.g_source_remove(self.idle);
         if (self.later != 0) _ = g.g_source_remove(self.later);
@@ -129,7 +150,7 @@ pub const Surface = struct {
 
     fn theme(self: *Surface) Theme {
         if (self.theme_override) |t| return t;
-        return if (@import("desktop.zig").isDark()) Theme.dark_theme else Theme.light;
+        return if (desktop.isDark()) Theme.dark_theme else Theme.light;
     }
 
     /// Builds, lays out and paints a frame; what it changed is drawn when

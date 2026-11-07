@@ -126,12 +126,44 @@ pub fn path(gpa: std.mem.Allocator, dir: Directory, app_name: []const u8) ![]u8 
     return full;
 }
 
-/// Whether the desktop asks for dark colors (a GTK theme named dark).
-pub fn isDark() bool {
-    const theme = env("GTK_THEME") orelse return false;
+fn nameIsDark(theme: []const u8) bool {
     var i: usize = 0;
     while (i + 4 <= theme.len) : (i += 1) if (std.ascii.eqlIgnoreCase(theme[i .. i + 4], "dark")) return true;
     return false;
+}
+
+/// GTK 4.20 reports the desktop's light or dark choice (the settings portal's).
+fn hasColorScheme() bool {
+    return gtk.v4 and gtk.v4api.gtk_get_minor_version() >= 20;
+}
+
+/// The GTK settings properties that decide `isDark`.
+pub const dark_properties = [_][*:0]const u8{ "notify::gtk-interface-color-scheme", "notify::gtk-application-prefer-dark-theme", "notify::gtk-theme-name" };
+
+/// Whether the desktop asks for dark colors: `GTK_THEME` when set, else
+/// the desktop's color scheme (GNOME's light or dark choice, GTK 4.20+), a
+/// GTK setting that prefers dark, or a GTK theme named dark.
+pub fn isDark() bool {
+    if (env("GTK_THEME")) |theme| return nameIsDark(theme);
+    if (!gtk.ready()) return false;
+    const settings = gtk.api.gtk_settings_get_default() orelse return false;
+    const get = gtk.api.g_object_get;
+    const end: ?*anyopaque = null;
+    if (hasColorScheme()) {
+        // GtkInterfaceColorScheme: 1 default, 2 dark, 3 light
+        var scheme: c_int = 0;
+        get(settings, "gtk-interface-color-scheme", &scheme, end);
+        if (scheme == 2) return true;
+        if (scheme == 3) return false;
+    }
+    var prefer: c_int = 0;
+    get(settings, "gtk-application-prefer-dark-theme", &prefer, end);
+    if (prefer != 0) return true;
+    var name: ?[*:0]u8 = null;
+    get(settings, "gtk-theme-name", &name, end);
+    const n = name orelse return false;
+    defer gtk.api.g_free(n);
+    return nameIsDark(std.mem.span(n));
 }
 
 pub fn accentColor() [3]f32 {

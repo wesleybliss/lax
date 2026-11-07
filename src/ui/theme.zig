@@ -1,13 +1,20 @@
-//! Material You (M3) baseline palette, loosely: tonal surfaces and a
-//! purple primary. Applied over nanoui's theme each frame, following the
-//! system's light or dark choice.
+//! Light and dark colors, and themes.
+//!
+//! The base is Material You (M3) baseline, loosely: tonal surfaces and a
+//! purple primary. A theme is a JSON file that overrides some of it (all
+//! optional, `#RRGGBB` or `#RRGGBBAA`): `colors` for both modes, then
+//! `light` or `dark` over that. Set a few seeds (`background`, `text`,
+//! `primary`, `secondary`, `accent`) and the rest follows them; any
+//! derived color can still be set by name. Built-in themes live in
+//! `themes/`, yours in `<config dir>/themes/*.json` (same format).
 const std = @import("std");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
 
 pub const Palette = struct {
-    /// Sidebar and rails: M3's surface container
+    /// Sidebar: M3's surface container
     container: ui.Color,
+    /// Workspace rail, chips, code backgrounds
     container_high: ui.Color,
     /// Selected navigation item
     secondary_container: ui.Color,
@@ -19,7 +26,68 @@ pub const Palette = struct {
     avatars: [8]ui.Color,
 };
 
-const light_palette: Palette = .{
+/// What a theme sets for one mode; null keeps the base (or what a seed derives)
+pub const Colors = struct {
+    // Neutrals
+    background: ?[]const u8 = null,
+    /// Cards, menus
+    surface: ?[]const u8 = null,
+    sidebar: ?[]const u8 = null,
+    /// Workspace rail, chips
+    rail: ?[]const u8 = null,
+    hover: ?[]const u8 = null,
+    text: ?[]const u8 = null,
+    muted: ?[]const u8 = null,
+    border: ?[]const u8 = null,
+    // Seeds
+    /// Buttons, toggles, focus
+    primary: ?[]const u8 = null,
+    /// Selected rows
+    secondary: ?[]const u8 = null,
+    /// Links, mentions and tags
+    accent: ?[]const u8 = null,
+    // Status
+    danger: ?[]const u8 = null,
+    success: ?[]const u8 = null,
+    // Derived from the seeds, settable
+    on_primary: ?[]const u8 = null,
+    primary_hover: ?[]const u8 = null,
+    primary_container: ?[]const u8 = null,
+    secondary_container: ?[]const u8 = null,
+    /// Up to 8 avatar colors
+    avatars: []const []const u8 = &.{},
+};
+
+pub const Fonts = struct {
+    /// Family of the interface; the Settings choice wins over it
+    ui: []const u8 = "",
+    /// Family of message text; the Settings choice wins over it
+    chat: []const u8 = "",
+};
+
+pub const Def = struct {
+    /// Unique; a file's name without `.json` when missing
+    id: []const u8 = "",
+    name: []const u8 = "",
+    author: []const u8 = "",
+    version: []const u8 = "",
+    description: []const u8 = "",
+    fonts: Fonts = .{},
+    /// Both modes
+    colors: Colors = .{},
+    light: Colors = .{},
+    dark: Colors = .{},
+};
+
+pub const default_id = "lax";
+
+/// A theme resolved for one mode
+pub const Resolved = struct {
+    theme: ui.Theme,
+    pal: Palette,
+};
+
+const light_pal: Palette = .{
     .container = .hex(0xf3edf7),
     .container_high = .hex(0xece6f0),
     .secondary_container = .hex(0xe8def8),
@@ -29,7 +97,7 @@ const light_palette: Palette = .{
     .avatars = .{ .hex(0x6750a4), .hex(0x625b71), .hex(0x7d5260), .hex(0x386a20), .hex(0x006a6a), .hex(0x8c4a60), .hex(0x00639b), .hex(0x8f4c38) },
 };
 
-const dark_palette: Palette = .{
+const dark_pal: Palette = .{
     .container = .hex(0x211f26),
     .container_high = .hex(0x2b2930),
     .secondary_container = .hex(0x4a4458),
@@ -75,17 +143,289 @@ const dark_theme: ui.Theme = .{
     .shadow = .{ .a = 0.4 },
 };
 
-/// Replaces nanoui's theme with ours (call first thing in `view`) and
-/// returns the extra tones
-pub fn apply(c: *ui.Context) Palette {
-    if (c.theme.dark) {
-        c.theme = dark_theme;
-        return dark_palette;
+/// The base colors of a mode, with no theme
+pub fn base(dark: bool) Resolved {
+    return if (dark) .{ .theme = dark_theme, .pal = dark_pal } else .{ .theme = light_theme, .pal = light_pal };
+}
+
+/// `#RGB`, `#RRGGBB` or `#RRGGBBAA` (the `#` is optional); null when invalid
+pub fn parseColor(text: []const u8) ?ui.Color {
+    const s = if (text.len > 0 and text[0] == '#') text[1..] else text;
+    switch (s.len) {
+        3 => {
+            var v: u24 = 0;
+            for (s) |ch| {
+                const d = std.fmt.charToDigit(ch, 16) catch return null;
+                v = v << 8 | @as(u24, d) * 17;
+            }
+            return .hex(v);
+        },
+        6, 8 => {
+            const rgb = std.fmt.parseInt(u24, s[0..6], 16) catch return null;
+            var c: ui.Color = .hex(rgb);
+            if (s.len == 8) {
+                const a = std.fmt.parseInt(u8, s[6..8], 16) catch return null;
+                c.a = @as(f32, @floatFromInt(a)) / 255;
+            }
+            return c;
+        },
+        else => return null,
     }
-    c.theme = light_theme;
-    return light_palette;
+}
+
+fn channel(v: f32) f32 {
+    return if (v <= 0.03928) v / 12.92 else std.math.pow(f32, (v + 0.055) / 1.055, 2.4);
+}
+
+fn luminance(c: ui.Color) f32 {
+    return 0.2126 * channel(c.r) + 0.7152 * channel(c.g) + 0.0722 * channel(c.b);
+}
+
+/// Text color that reads on `c`: near black on light colors, white on dark
+pub fn onColor(c: ui.Color) ui.Color {
+    return if (luminance(c) > 0.179) .hex(0x1d1b20) else .white;
+}
+
+/// `c` with its alpha made opaque, for blending derived tones
+fn solid(c: ui.Color) ui.Color {
+    return .{ .r = c.r, .g = c.g, .b = c.b };
+}
+
+fn set(slot: *ui.Color, text: ?[]const u8) void {
+    if (text) |t| if (parseColor(t)) |c| {
+        slot.* = c;
+    };
+}
+
+fn has(text: ?[]const u8) ?ui.Color {
+    const t = text orelse return null;
+    return parseColor(t);
+}
+
+/// Applies a theme's colors for one mode over `r`: neutrals first (the
+/// tones of a background follow it), then seeds (their tones follow
+/// them), then the colors set by name
+fn applyColors(r: *Resolved, o: Colors) void {
+    const t = &r.theme;
+    const p = &r.pal;
+    const dark = t.dark;
+
+    // Neutrals
+    const bg = has(o.background);
+    const fg = has(o.text);
+    if (fg) |c| {
+        t.text = c;
+        t.knob = if (dark) c else .white;
+    }
+    if (bg) |c| t.background = solid(c);
+    if (bg != null or fg != null) {
+        const b = t.background;
+        const f = t.text;
+        t.muted = f.mix(b, 0.28);
+        t.border = b.mix(f, 0.2);
+        t.track = b.mix(f, 0.12);
+    }
+    if (bg != null) {
+        const b = t.background;
+        const f = t.text;
+        t.surface = b.mix(f, 0.04);
+        t.surface_hover = b.mix(f, 0.08);
+        p.container = t.surface;
+        p.container_high = b.mix(f, 0.08);
+    }
+
+    // Seeds
+    if (has(o.primary)) |c| {
+        const b = t.background;
+        t.accent = c;
+        t.accent_hover = c.mix(t.text, 0.3);
+        t.accent_text = onColor(c);
+        p.primary_container = c.mix(b, if (dark) 0.7 else 0.8);
+        p.on_primary_container = onColor(p.primary_container);
+        p.link = c;
+    }
+    if (has(o.secondary)) |c| p.secondary_container = c.mix(t.background, if (dark) 0.6 else 0.85);
+    if (has(o.accent)) |c| p.link = c;
+    set(&t.danger, o.danger);
+    set(&t.success, o.success);
+
+    // By name
+    set(&t.surface, o.surface);
+    set(&p.container, o.sidebar orelse o.surface);
+    set(&p.container_high, o.rail);
+    set(&t.surface_hover, o.hover);
+    set(&t.muted, o.muted);
+    set(&t.border, o.border);
+    set(&t.accent_text, o.on_primary);
+    set(&t.accent_hover, o.primary_hover);
+    set(&p.primary_container, o.primary_container);
+    set(&p.secondary_container, o.secondary_container);
+    for (o.avatars, 0..) |text, i| {
+        if (i >= p.avatars.len) break;
+        set(&p.avatars[i], text);
+    }
+}
+
+/// The colors of `def` (null: the base) in light or dark
+pub fn resolve(def: ?*const Def, dark: bool) Resolved {
+    var r = base(dark);
+    if (def) |d| {
+        applyColors(&r, d.colors);
+        applyColors(&r, if (dark) d.dark else d.light);
+    }
+    return r;
+}
+
+/// Replaces nanoui's theme with `r` (call first thing in `view`)
+pub fn apply(c: *ui.Context, r: Resolved) Palette {
+    c.theme = r.theme;
+    return r.pal;
 }
 
 pub fn avatarColor(p: Palette, id: []const u8) ui.Color {
     return p.avatars[std.hash.Wyhash.hash(0, id) % p.avatars.len];
+}
+
+// Catalog
+
+const built_in = [_][]const u8{
+    @embedFile("themes/lax.json"),
+    @embedFile("themes/ocean.json"),
+    @embedFile("themes/forest.json"),
+    @embedFile("themes/rose.json"),
+    @embedFile("themes/graphite.json"),
+};
+
+fn parse(arena: std.mem.Allocator, data: []const u8) ?Def {
+    return std.json.parseFromSliceLeaky(Def, arena, data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch null;
+}
+
+/// Adds `def`, replacing one with the same id
+fn put(arena: std.mem.Allocator, list: *std.ArrayList(Def), def: Def) void {
+    for (list.items) |*d| if (std.mem.eql(u8, d.id, def.id)) {
+        d.* = def;
+        return;
+    };
+    list.append(arena, def) catch {};
+}
+
+/// The built-in themes, then the ones in `<dir>/themes` (null: none). A
+/// file that is not a valid theme is skipped. Everything lives in `arena`.
+pub fn loadAll(arena: std.mem.Allocator, io: std.Io, dir: ?[]const u8) []const Def {
+    var list: std.ArrayList(Def) = .empty;
+    for (built_in) |data| if (parse(arena, data)) |d| put(arena, &list, d);
+    const root = dir orelse return list.items;
+    const path = std.fs.path.join(arena, &.{ root, "themes" }) catch return list.items;
+    var themes = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch return list.items;
+    defer themes.close(io);
+    var names: std.ArrayList([]const u8) = .empty;
+    var it = themes.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        names.append(arena, arena.dupe(u8, entry.name) catch continue) catch {};
+    }
+    std.mem.sort([]const u8, names.items, {}, struct {
+        fn less(_: void, a: []const u8, b: []const u8) bool {
+            return std.ascii.lessThanIgnoreCase(a, b);
+        }
+    }.less);
+    for (names.items) |name| {
+        const data = themes.readFileAlloc(io, name, arena, .limited(1 << 16)) catch continue;
+        var def = parse(arena, data) orelse continue;
+        const stem = name[0 .. name.len - ".json".len];
+        if (def.id.len == 0) def.id = stem;
+        if (def.name.len == 0) def.name = def.id;
+        put(arena, &list, def);
+    }
+    return list.items;
+}
+
+/// The theme with `id`, null for an unknown one
+pub fn find(defs: []const Def, id: []const u8) ?*const Def {
+    for (defs) |*d| if (std.mem.eql(u8, d.id, id)) return d;
+    return null;
+}
+
+// Tests
+
+test "colors parse, bad ones don't" {
+    const c = parseColor("#6750a4").?;
+    try std.testing.expectApproxEqAbs(@as(f32, 0x67) / 255, c.r, 0.001);
+    try std.testing.expectEqual(@as(f32, 1), c.a);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), parseColor("#ff000080").?.a, 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), parseColor("f00").?.r, 0.001);
+    try std.testing.expect(parseColor("#12") == null);
+    try std.testing.expect(parseColor("#gggggg") == null);
+    try std.testing.expect(parseColor("") == null);
+}
+
+test "a theme with one seed derives the rest from it" {
+    const def: Def = .{ .id = "t", .colors = .{ .primary = "#0b61a4" } };
+    const r = resolve(&def, false);
+    try std.testing.expectEqual(parseColor("#0b61a4").?, r.theme.accent);
+    // Text on a dark primary is white, the tint follows the primary
+    try std.testing.expectEqual(ui.Color.white, r.theme.accent_text);
+    try std.testing.expect(r.pal.primary_container.b > r.pal.primary_container.r);
+    // What it did not set stays the base
+    try std.testing.expectEqual(light_theme.background, r.theme.background);
+    // Named colors win over derived ones
+    const named: Def = .{ .colors = .{ .primary = "#0b61a4", .on_primary = "#ffee00" } };
+    try std.testing.expectEqual(parseColor("#ffee00").?, resolve(&named, false).theme.accent_text);
+}
+
+test "light and dark blocks apply to their own mode, over the shared colors" {
+    const def: Def = .{
+        .colors = .{ .primary = "#112233", .danger = "#aa0000" },
+        .dark = .{ .primary = "#ddeeff" },
+    };
+    try std.testing.expectEqual(parseColor("#112233").?, resolve(&def, false).theme.accent);
+    try std.testing.expectEqual(parseColor("#ddeeff").?, resolve(&def, true).theme.accent);
+    try std.testing.expectEqual(parseColor("#aa0000").?, resolve(&def, true).theme.danger);
+    try std.testing.expect(resolve(&def, true).theme.dark);
+}
+
+test "a background derives its surfaces; bad colors are ignored" {
+    const def: Def = .{ .light = .{ .background = "#ffffff", .text = "#000000", .secondary = "nope" } };
+    const r = resolve(&def, false);
+    try std.testing.expectEqual(ui.Color.white, r.theme.background);
+    try std.testing.expect(r.theme.surface.r < 1 and r.theme.surface.r > 0.9);
+    try std.testing.expectEqual(light_pal.secondary_container, r.pal.secondary_container);
+}
+
+test "built-in themes parse and each differs from the base in both modes" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const defs = loadAll(arena_state.allocator(), std.testing.io, null);
+    try std.testing.expectEqual(built_in.len, defs.len);
+    try std.testing.expect(find(defs, default_id) != null);
+    for (defs) |*d| {
+        try std.testing.expect(d.name.len > 0);
+        if (std.mem.eql(u8, d.id, default_id)) continue;
+        for ([_]bool{ false, true }) |dark| {
+            const r = resolve(d, dark);
+            try std.testing.expect(!std.meta.eql(r.theme.accent, base(dark).theme.accent));
+        }
+    }
+}
+
+test "user themes load from the themes directory; a same-id file replaces a built-in" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try tmp.dir.createDirPath(io, "lax/themes");
+    try tmp.dir.writeFile(io, .{ .sub_path = "lax/themes/mine.json", .data = "{\"colors\":{\"primary\":\"#ff0000\"}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "lax/themes/ocean.json", .data = "{\"id\":\"ocean\",\"name\":\"My Ocean\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "lax/themes/broken.json", .data = "{nope" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "lax/themes/notes.txt", .data = "ignored" });
+    const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/lax", .{tmp.sub_path});
+    const defs = loadAll(arena, io, dir);
+    try std.testing.expectEqual(built_in.len + 1, defs.len);
+    const mine = find(defs, "mine").?;
+    try std.testing.expectEqualStrings("mine", mine.name);
+    try std.testing.expectEqualStrings("My Ocean", find(defs, "ocean").?.name);
+    try std.testing.expect(find(defs, "broken") == null);
 }

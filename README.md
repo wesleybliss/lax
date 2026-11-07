@@ -41,7 +41,29 @@ Lax only calls endpoints the web client calls, at human-plausible rates, and use
 
 ## Status
 
-Working: all signed-in workspaces (rail on the left with icons and name tooltips, last used remembered, each workspace cached in memory so switching is instant and can be changed mid-load), resizable sidebar laid out like Slack's (Threads, Huddles, Drafts & sent and Saved rows (Threads, Drafts & sent and Saved are pages), then Starred, your own sections, Channels, Direct messages and Apps, read from `users.channelSections.list`; listed by your own Slack "sidebar" preference: with "Most recent" the conversations Slack marks dormant fold behind "Show N hidden"; unread dots and mention badges from `client.counts`, presence dots), busy conversations load in the background after connecting, opens with the last known state (conversations, people and the last 25 messages of the ones loaded, kept in `~/.cache/lax`, readable only by you; the network then updates it), account menu on your avatar (away toggle, profile, settings, exit), Settings (interface and chat font, interface zoom, message text size; `~/.config/lax/settings.json`), window and sidebar size remembered (`~/.config/lax/layout.json`), message box of 2 lines with a button on its border for 10, message list (variable height, bottom anchored, older pages on scroll up, selectable text, mrkdwn, clickable links, avatars), reactions (pills, hover toolbar), threads (side panel, reply), typing indicators (in and out), live receive, send, edits and deletes, mark read, `@mention` / `#channel` / `:emoji:` completion, emoji shortcodes.
+Working: all signed-in workspaces (rail on the left with icons and name tooltips, last used remembered, each workspace cached in memory so switching is instant and can be changed mid-load), resizable sidebar laid out like Slack's (Threads, Huddles, Drafts & sent and Saved rows (Threads, Drafts & sent and Saved are pages), then Starred, your own sections, Channels, Direct messages and Apps, read from `users.channelSections.list`; listed by your own Slack "sidebar" preference: with "Most recent" the conversations Slack marks dormant fold behind "Show N hidden"; unread dots and mention badges from `client.counts`, presence dots), busy conversations load in the background after connecting, opens with the last known state (conversations, people and the last 25 messages of the ones loaded, kept in `~/.cache/lax`, readable only by you; the network then updates it), account menu on your avatar (away toggle, profile, settings, exit), light and dark (follows the desktop live, or forced in Settings or from the account menu) with color themes (five built in, yours in `~/.config/lax/themes`, see Themes), Settings (appearance, theme, interface and chat font, interface zoom, message text size; `~/.config/lax/settings.json`), window and sidebar size remembered (`~/.config/lax/layout.json`), message box of 2 lines with a button on its border for 10, message list (variable height, bottom anchored, older pages on scroll up, selectable text, mrkdwn, clickable links, avatars), reactions (pills, hover toolbar), threads (side panel, reply), typing indicators (in and out), live receive, send, edits and deletes, mark read, `@mention` / `#channel` / `:emoji:` completion, emoji shortcodes.
+
+## Themes
+
+Settings > Appearance: Mode (System, Light, Dark; "System" follows the desktop and changes live) and Theme. The account menu has a quick Dark mode / Light mode toggle (it sets Mode).
+
+A theme is a JSON file in `~/.config/lax/themes/` (Settings rescans when it opens; same `id` as a built-in replaces it). Everything is optional, colors are `#RGB`, `#RRGGBB` or `#RRGGBBAA`, unknown fields and bad colors are ignored. `colors` applies to both modes, then `light` or `dark` over it. A mode with no colors keeps the default look.
+
+```json
+{
+    "id": "mint",
+    "name": "Mint",
+    "author": "You",
+    "fonts": { "ui": "Inter", "chat": "Noto Serif" },
+    "colors": { "danger": "#b3261e" },
+    "light": { "background": "#f6fbf8", "primary": "#1b7f5c", "secondary": "#5b8a78", "accent": "#7a4fb3" },
+    "dark": { "background": "#0e1512", "text": "#dde7e2", "primary": "#7fdcb5", "secondary": "#9cc4b3", "accent": "#c7a6f0" }
+}
+```
+
+- Seeds: `background`, `text`, `primary` (buttons, toggles), `secondary` (selected rows), `accent` (links, mentions, tags). Everything else follows them.
+- Neutrals you can set by name: `surface`, `sidebar`, `rail`, `hover`, `muted`, `border`. Status: `danger`, `success`. Derived, settable: `on_primary`, `primary_hover`, `primary_container`, `secondary_container`. `avatars`: up to 8 colors.
+- `fonts` apply where Settings choose no font. The built-in themes are in `src/ui/themes/`.
 
 Credentials: your saved session lives in the system keyring. If Slack rejects it, Lax re-reads the desktop app's session once, then asks you to paste a token and cookie.
 

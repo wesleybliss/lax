@@ -1,0 +1,20 @@
+{
+    "id": "graphite",
+    "name": "Graphite",
+    "author": "Lax",
+    "description": "Neutral grays, one calm blue",
+    "light": {
+        "background": "#fafafa",
+        "text": "#1c1c1e",
+        "primary": "#3a5a80",
+        "secondary": "#6c6c70",
+        "accent": "#3a5a80"
+    },
+    "dark": {
+        "background": "#131314",
+        "text": "#e4e4e6",
+        "primary": "#a6c4ea",
+        "secondary": "#a1a1a6",
+        "accent": "#a6c4ea"
+    }
+}

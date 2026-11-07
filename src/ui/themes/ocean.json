@@ -1,0 +1,21 @@
+{
+    "id": "ocean",
+    "name": "Ocean",
+    "author": "Lax",
+    "description": "Cool blues with a teal accent",
+    "light": {
+        "background": "#f7fafd",
+        "primary": "#0b61a4",
+        "secondary": "#4f6f8a",
+        "accent": "#00797a",
+        "danger": "#ba1a1a"
+    },
+    "dark": {
+        "background": "#0f1418",
+        "text": "#dfe3e8",
+        "primary": "#9ecaff",
+        "secondary": "#8fb0cc",
+        "accent": "#4fd8d8",
+        "danger": "#ffb4ab"
+    }
+}

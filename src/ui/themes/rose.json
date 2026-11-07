@@ -1,0 +1,19 @@
+{
+    "id": "rose",
+    "name": "Rose",
+    "author": "Lax",
+    "description": "Soft pink with a berry accent",
+    "light": {
+        "background": "#fff8f8",
+        "primary": "#a8365f",
+        "secondary": "#8a5d68",
+        "accent": "#7b4fa0"
+    },
+    "dark": {
+        "background": "#181114",
+        "text": "#ecdfe2",
+        "primary": "#ffb1c8",
+        "secondary": "#d8aab7",
+        "accent": "#d7b3f5"
+    }
+}

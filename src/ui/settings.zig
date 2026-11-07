@@ -6,7 +6,14 @@ pub const interface_max = 125;
 pub const chat_min = 12;
 pub const chat_max = 22;
 
+/// Which colors: the system's light or dark choice, or one forced
+pub const Appearance = enum { system, light, dark };
+
 pub const Settings = struct {
+    /// Light or dark; `system` follows the desktop
+    appearance: Appearance = .system,
+    /// Id of the color theme; empty is the default
+    theme: []const u8 = "",
     /// Font family of the interface; empty is the system's
     ui_font: []const u8 = "",
     /// Font family of message text; empty is the interface's
@@ -54,8 +61,11 @@ test "settings round trip, clamping, defaults" {
     const dir = try std.fmt.allocPrint(arena, ".zig-cache/tmp/{s}/lax", .{tmp.sub_path});
 
     try std.testing.expectEqual(@as(u16, 15), load(arena, io, dir).chat_size);
-    save(gpa, io, dir, .{ .ui_font = "Inter", .chat_font = "Noto Serif", .interface_size = 110, .chat_size = 99 });
+    try std.testing.expectEqual(Appearance.system, load(arena, io, dir).appearance);
+    save(gpa, io, dir, .{ .appearance = .dark, .theme = "ocean", .ui_font = "Inter", .chat_font = "Noto Serif", .interface_size = 110, .chat_size = 99 });
     const got = load(arena, io, dir);
+    try std.testing.expectEqual(Appearance.dark, got.appearance);
+    try std.testing.expectEqualStrings("ocean", got.theme);
     try std.testing.expectEqualStrings("Inter", got.ui_font);
     try std.testing.expectEqualStrings("Noto Serif", got.chat_font);
     try std.testing.expectEqual(@as(u16, 110), got.interface_size);
