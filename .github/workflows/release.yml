@@ -73,7 +73,11 @@ jobs:
                   go install github.com/goreleaser/nfpm/v2/cmd/nfpm@latest
                   echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
                   sudo apt-get update
-                  sudo apt-get install -y zip fonts-noto-core fonts-noto-color-emoji flatpak flatpak-builder
+                  sudo apt-get install -y zip fonts-noto-core flatpak flatpak-builder
+                  # Ubuntu's emoji package is a bitmap font (CBDT); the renderer reads COLR
+                  mkdir -p ~/.local/share/fonts
+                  curl -fsSL -o ~/.local/share/fonts/Noto-COLRv1.ttf \
+                      https://github.com/googlefonts/noto-emoji/raw/v2026-09-24-unicode18_0/2D/fonts/Noto-COLRv1.ttf
                   sudo apt-get install -y libfuse2t64 || sudo apt-get install -y libfuse2
                   flatpak remote-add --user --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
             - name: Test

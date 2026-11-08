@@ -228,6 +228,7 @@ const Fake = struct {
     typing_calls: usize = 0,
     away: ?bool = null,
     feed_calls: usize = 0,
+    update_calls: usize = 0,
     feed_kind: ?store.FeedKind = null,
     edited: [128]u8 = undefined,
     edited_len: usize = 0,
@@ -258,7 +259,14 @@ const Fake = struct {
             .manual = manual,
             .set_presence = setPresence,
             .load_feed = loadFeed,
+            .apply_update = applyUpdate,
+            .update_ctx = f,
         };
+    }
+
+    fn applyUpdate(ctx: *anyopaque) void {
+        const f: *Fake = @ptrCast(@alignCast(ctx));
+        f.update_calls += 1;
     }
 
     fn loadFeed(ctx: *anyopaque, kind: store.FeedKind) void {
@@ -1461,6 +1469,47 @@ test "composer: two lines by default, the border button makes it ten" {
     try std.testing.expectApproxEqAbs(small.y, t.findText("Message #general").?.y, 1);
 }
 
+test "app update: the rail shows an arrow, a click installs, a failure can be retried" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    // The tile sits right above the avatar: 12 apart
+    const x: f32 = 38;
+    const y: f32 = 640 - 16 - 52 - 12 - 26;
+
+    // Nothing to update: a click there is a click on empty rail
+    for (0..4) |_| t.frame();
+    t.click(x, y);
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqual(@as(usize, 0), fake.update_calls);
+
+    try st.apply(.{ .app_update = .{ .phase = .available, .version = "0.3.0" } });
+    for (0..4) |_| t.frame();
+    try t.screenshot("/tmp/lax-update.png");
+    t.click(x, y);
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqual(@as(usize, 1), fake.update_calls);
+
+    // Busy: clicks do nothing
+    try st.apply(.{ .app_update = .{ .phase = .downloading, .version = "0.3.0" } });
+    for (0..3) |_| t.frame();
+    t.click(x, y);
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqual(@as(usize, 1), fake.update_calls);
+
+    try st.apply(.{ .app_update = .{ .phase = .failed, .version = "0.3.0", .message = "Install cancelled" } });
+    for (0..3) |_| t.frame();
+    t.click(x, y);
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqual(@as(usize, 2), fake.update_calls);
+}
+
 test "account menu: avatar opens it, Settings opens the page, fonts and sizes apply" {
     const gpa = std.testing.allocator;
     var st = store.Store.init(gpa);
@@ -1597,7 +1646,8 @@ test "fonts: the chat font changes message text only, and a bad name falls back"
     state.applySettings(.{ .chat_font = "Noto Serif" });
     for (0..4) |_| t.frame();
     const serif = t.ctx.text.caretX(text, chat_st, text.len);
-    try std.testing.expect(@abs(serif - plain) > 4);
+    // Static Noto Serif is only ~2px wider than Noto Sans here; any change proves the font applied
+    try std.testing.expect(@abs(serif - plain) > 1);
     // The interface font is untouched
     try std.testing.expectApproxEqAbs(plain, t.ctx.text.caretX(text, iface, text.len), 0.5);
     try std.testing.expect(t.hasText("general"));
