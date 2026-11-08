@@ -177,13 +177,14 @@ const TopView = enum {
         };
     }
 
-    fn glyph(v: TopView) []const u8 {
+    /// Lucide line icon, tinted to the row's text color
+    fn svg(v: TopView) []const u8 {
         return switch (v) {
             .none => "",
-            .threads => "💬",
-            .huddles => "🎧",
-            .drafts => "📝",
-            .saved => "🔖",
+            .threads => @embedFile("icons/threads.svg"),
+            .huddles => @embedFile("icons/huddles.svg"),
+            .drafts => @embedFile("icons/drafts.svg"),
+            .saved => @embedFile("icons/saved.svg"),
         };
     }
 };
@@ -1265,7 +1266,8 @@ pub const State = struct {
                 s.settings_open = false;
             }
             const icon = ui.div(c).w(nav_icon).h(s.rowH()).center();
-            ui.text(c, v.glyph(), .{ .size = 15 });
+            const tint = if (active) c.theme.text else c.theme.muted;
+            _ = ui.svg(c, .{ .key = v.label(), .bytes = v.svg(), .size = 18, .color = tint });
             icon.end();
             ui.text(c, v.label(), .{ .size = 15, .weight = if (active) .semibold else .regular, .color = if (active) c.theme.text else c.theme.muted });
         }
