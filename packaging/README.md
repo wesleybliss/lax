@@ -21,6 +21,16 @@ Build Linux binaries for glibc 2.31 so they run on older distros: `zig build -Dt
 
 macOS signing and notarizing use these repo secrets, and are skipped (ad-hoc signed app) without them: `MACOS_CERTIFICATE` (base64 Developer ID .p12), `MACOS_CERTIFICATE_PASSWORD`, `MACOS_SIGN_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID`, `APPLE_APP_PASSWORD`.
 
+## Self-update (Linux)
+
+On startup and every 30 minutes Lax asks GitHub for the latest release. When it is newer, an arrow appears above the account button; clicking it downloads the matching file, checks it against `SHA256SUMS`, and installs it:
+
+- rpm / deb: `pkexec dnf install` / `pkexec apt-get install` (polkit shows the password prompt), then Lax restarts.
+- AppImage: the running `.AppImage` is replaced in place (its folder must be writable), then Lax restarts.
+- zip, `zig build` and Flatpak installs never check. `LAX_NO_UPDATE=1` turns it off.
+
+Release assets must keep their arch in the name (`x86_64`, `aarch64`, `amd64`, `arm64`) and each release needs `SHA256SUMS`: the updater picks files by extension and arch. Code: `src/app/updater.zig`.
+
 ## Layout
 
 - `icon/`: `lax-1024.png` is the source (transparent background); the other PNGs and `lax.ico` are resized from it with `magick`.

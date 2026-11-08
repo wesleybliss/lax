@@ -1,4 +1,5 @@
 const std = @import("std");
+const zon = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -36,6 +37,10 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    // The running version, for the updater
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", zon.version);
+
     // Network thread: protocol layer feeding the store
     const app_mod = b.addModule("app", .{
         .root_source_file = b.path("src/app/root.zig"),
@@ -45,6 +50,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "slack", .module = slack },
             .{ .name = "store", .module = store },
+            .{ .name = "build_options", .module = build_options.createModule() },
         },
     });
 

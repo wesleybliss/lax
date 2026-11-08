@@ -164,6 +164,25 @@ pub const UnreadInfo = struct {
     latest: []const u8 = "",
 };
 
+/// Where an app update is, from the updater thread's point of view
+pub const UpdatePhase = enum {
+    /// A newer release exists; clicking installs it
+    available,
+    downloading,
+    /// The package manager is running (it asks for the password)
+    installing,
+    /// Something went wrong (`message`); clicking tries again
+    failed,
+    /// Installed: the app should restart into it
+    restart,
+};
+
+pub const AppUpdate = struct {
+    phase: UpdatePhase,
+    version: []const u8,
+    message: []const u8 = "",
+};
+
 pub const Update = union(enum) {
     self: struct { user_id: []const u8, team_name: []const u8 },
     channels: []const ChannelInfo,
@@ -205,6 +224,8 @@ pub const Update = union(enum) {
     connection: Connection,
     /// A human-readable problem for the status line
     status: []const u8,
+    /// The app itself: a newer release, and how installing it is going
+    app_update: AppUpdate,
 };
 
 /// An update with the memory its slices point into
@@ -344,6 +365,8 @@ pub const Store = struct {
     feeds: [feed_kinds]Feed = @splat(.{}),
     /// Filled from the disk cache; the first workspace list confirms or replaces it
     from_cache: bool = false,
+    /// A newer release of the app (not tied to a workspace); its strings are owned
+    app_update: ?AppUpdate = null,
     /// Other workspaces' data, by team id
     parked: std.StringHashMapUnmanaged(Space) = .empty,
     /// Files' preview pictures by file id (ids are unique across workspaces)
@@ -353,7 +376,15 @@ pub const Store = struct {
         return .{ .gpa = gpa, .self_id = &.{}, .team_name = &.{}, .status = &.{}, .active_team = &.{} };
     }
 
+    fn clearAppUpdate(s: *Store) void {
+        const u = s.app_update orelse return;
+        s.gpa.free(u.version);
+        s.gpa.free(u.message);
+        s.app_update = null;
+    }
+
     pub fn deinit(s: *Store) void {
+        s.clearAppUpdate();
         s.gpa.free(s.active_team);
         if (s.need_manual) |m| s.gpa.free(m);
         s.clearTeams();
@@ -489,7 +520,7 @@ pub const Store = struct {
     /// Applies an update the network side tagged with its workspace
     pub fn applyItem(s: *Store, item: *const Item) std.mem.Allocator.Error!void {
         switch (item.update) {
-            .teams, .need_manual, .manual_done => return s.apply(item.update),
+            .teams, .need_manual, .manual_done, .app_update => return s.apply(item.update),
             else => {},
         }
         const tag = item.team();
@@ -842,6 +873,13 @@ pub const Store = struct {
             },
             .connection => |v| s.connection = v,
             .status => |msg| try s.replace(&s.status, msg),
+            .app_update => |info| {
+                const version = try s.gpa.dupe(u8, info.version);
+                errdefer s.gpa.free(version);
+                const message = try s.gpa.dupe(u8, info.message);
+                s.clearAppUpdate();
+                s.app_update = .{ .phase = info.phase, .version = version, .message = message };
+            },
         }
     }
 
@@ -1152,6 +1190,20 @@ test "unreads, mentions, teams and reset" {
     try std.testing.expectEqualStrings("no session", s.need_manual.?);
     try s.apply(.manual_done);
     try std.testing.expect(s.need_manual == null);
+}
+
+test "app update: shown across workspaces, replaced by the next phase" {
+    var s = Store.init(std.testing.allocator);
+    defer s.deinit();
+    var item: Item = .{ .arena = .init(std.testing.allocator), .update = .{ .app_update = .{ .phase = .available, .version = "0.3.0" } } };
+    item.setTeam("T1");
+    defer item.deinit();
+    try s.applyItem(&item);
+    try std.testing.expectEqual(UpdatePhase.available, s.app_update.?.phase);
+    try std.testing.expectEqualStrings("0.3.0", s.app_update.?.version);
+    try s.apply(.{ .app_update = .{ .phase = .failed, .version = "0.3.0", .message = "no password" } });
+    try std.testing.expectEqual(UpdatePhase.failed, s.app_update.?.phase);
+    try std.testing.expectEqualStrings("no password", s.app_update.?.message);
 }
 
 test "reactions: history, live add and remove" {

@@ -39,6 +39,8 @@ overrides:
             - xdg-utils
         recommends:
             - fonts-noto-color-emoji
+            # Self-update asks for the password through it
+            - policykit-1 | pkexec
     rpm:
         depends:
             - (gtk4 or gtk3)
@@ -46,3 +48,5 @@ overrides:
             - xdg-utils
         recommends:
             - google-noto-color-emoji-fonts
+            # Self-update asks for the password through it
+            - polkit

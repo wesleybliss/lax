@@ -86,6 +86,9 @@ pub const Actions = struct {
     fetch_image: *const fn (ctx: *anyopaque, id: []const u8, url: []const u8) void,
     /// Load (or refresh) one of the top-row pages
     load_feed: *const fn (ctx: *anyopaque, kind: store.FeedKind) void,
+    /// Download and install the announced app update (`store.app_update`)
+    apply_update: *const fn (ctx: *anyopaque) void,
+    update_ctx: *anyopaque,
 };
 
 /// A top-row page is fetched again when opened after this long
@@ -552,7 +555,32 @@ pub const State = struct {
             kit.tooltip(c, it, team.name, .{ .placement = .right, .delay = 0.3 });
         }
         ui.spacer(c);
+        s.updateTile(c);
         s.userTile(c);
+    }
+
+    /// A circular arrow above your avatar when the app has an update: click to
+    /// install it. A spinner while that runs, and a red arrow to retry if it failed.
+    fn updateTile(s: *State, c: *ui.Context) void {
+        const up = s.store.app_update orelse return;
+        const working = up.phase == .downloading or up.phase == .installing or up.phase == .restart;
+        const tile = ui.div(c).w(52).h(52).center().rounded(12).control().hover(c.theme.surface_hover);
+        defer tile.end();
+        const it = tile.interaction();
+        if (it.clicked and !working) s.actions.apply_update(s.actions.update_ctx);
+        if (working) {
+            kit.spinner(c, .{ .size = 22, .color = c.theme.accent });
+        } else {
+            ui.icon(c, "arrow.clockwise", .{ .size = 24, .frame = 28, .weight = .semibold, .color = if (up.phase == .failed) c.theme.danger else c.theme.accent });
+        }
+        const tip = switch (up.phase) {
+            .available => c.print("Update to v{s}", .{up.version}),
+            .downloading => "Downloading update…",
+            .installing => "Installing update…",
+            .failed => c.print("{s}. Click to try again", .{up.message}),
+            .restart => "Restarting…",
+        };
+        kit.tooltip(c, it, tip, .{ .placement = .right, .delay = 0.3 });
     }
 
     /// Your avatar at the bottom of the rail; opens the account menu

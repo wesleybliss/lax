@@ -20,6 +20,8 @@ const Pump = struct {
     /// Where the last known state is saved (null: nowhere)
     cache_dir: ?[]const u8 = null,
     dirty: bool = false,
+    /// An update was installed: the window is closing so the app restarts
+    restarting: bool = false,
     last_save_ms: i64 = 0,
     /// `LAX_DEBUG=1`: log update counts (never content, tokens or cookies)
     debug: bool = false,
@@ -36,7 +38,13 @@ const Pump = struct {
         }
         if (p.debug) std.debug.print("wake: applied {d} updates, {d} channels, {d} users, connection={s}\n", .{ items.items.len, p.st.channels.items.len, p.st.users.count(), @tagName(p.st.connection) });
         p.state.afterUpdates();
-        if (p.window) |w| w.redraw();
+        if (p.window) |w| {
+            if (!p.restarting) if (p.st.app_update) |u| if (u.phase == .restart) {
+                p.restarting = true;
+                return w.close();
+            };
+            w.redraw();
+        }
         p.dirty = true;
         p.saveCache(false);
     }
@@ -128,12 +136,24 @@ fn actionFeed(ctx: *anyopaque, kind: store.FeedKind) void {
     net.loadFeed(kind);
 }
 
+fn actionApplyUpdate(ctx: *anyopaque) void {
+    const updater: *app.updater.Updater = @ptrCast(@alignCast(ctx));
+    updater.apply();
+}
+
 fn actionManual(ctx: *anyopaque, url: []const u8, token: []const u8, cookie: []const u8) void {
     const net: *Net = @ptrCast(@alignCast(ctx));
     net.manualCredentials(url, token, cookie);
 }
 
 pub fn main(init: std.process.Init) !void {
+    // Where to start the new version after an update, once everything below is torn down
+    var relaunch_path: ?[]const u8 = null;
+    try run(init, &relaunch_path);
+    if (relaunch_path) |path| app.updater.relaunch(init.gpa, init.io, path);
+}
+
+fn run(init: std.process.Init, relaunch_path: *?[]const u8) !void {
     const gpa = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     var team: ?[]const u8 = null;
@@ -149,6 +169,7 @@ pub fn main(init: std.process.Init) !void {
     var wake = try store.Wake.init();
     defer wake.deinit();
     var net: Net = .{ .gpa = gpa, .io = init.io, .env = init.environ_map, .team_hint = team, .wake = &wake };
+    var updater: app.updater.Updater = .{ .gpa = gpa, .io = init.io, .env = init.environ_map, .updates = &net.updates, .wake = &wake };
 
     var state = ui.app_view.State.init(gpa, init.io, &st, .{
         .ctx = &net,
@@ -168,6 +189,8 @@ pub fn main(init: std.process.Init) !void {
         .manual = actionManual,
         .set_presence = actionPresence,
         .load_feed = actionFeed,
+        .update_ctx = &updater,
+        .apply_update = actionApplyUpdate,
     });
     defer state.deinit();
     state.preferred = channel;
@@ -218,8 +241,15 @@ pub fn main(init: std.process.Init) !void {
 
     try net.start();
     defer net.stop();
+    // Stops before the network side, whose queue it feeds
+    try updater.start();
+    defer updater.stop();
     try nano.run();
     state.flushLayout();
     pump.dirty = true;
     pump.saveCache(true);
+    // The updater's thread is done by now (it asked for this restart)
+    if (pump.restarting) if (updater.relaunch_path) |p| {
+        relaunch_path.* = try init.arena.allocator().dupe(u8, p);
+    };
 }
