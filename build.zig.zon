@@ -1,6 +1,6 @@
 .{
     .name = .lax_slack_clone,
-    .version = "0.4.1",
+    .version = "0.4.2",
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
         .websocket = .{
