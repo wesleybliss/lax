@@ -6,7 +6,8 @@
 //! `light` or `dark` over that. Set a few seeds (`background`, `text`,
 //! `primary`, `secondary`, `accent`) and the rest follows them; any
 //! derived color can still be set by name. Built-in themes live in
-//! `themes/`, yours in `<config dir>/themes/*.json` (same format).
+//! `themes/` (copied to `<config dir>/themes/` on first run), yours in
+//! `<config dir>/custom/themes/*.json` (same format).
 const std = @import("std");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
@@ -288,13 +289,31 @@ pub fn avatarColor(p: Palette, id: []const u8) ui.Color {
 
 // Catalog
 
-const built_in = [_][]const u8{
-    @embedFile("themes/lax.json"),
-    @embedFile("themes/ocean.json"),
-    @embedFile("themes/forest.json"),
-    @embedFile("themes/rose.json"),
-    @embedFile("themes/graphite.json"),
+const BuiltIn = struct { file: []const u8, data: []const u8 };
+
+const built_in = [_]BuiltIn{
+    .{ .file = "lax.json", .data = @embedFile("themes/lax.json") },
+    .{ .file = "ocean.json", .data = @embedFile("themes/ocean.json") },
+    .{ .file = "forest.json", .data = @embedFile("themes/forest.json") },
+    .{ .file = "rose.json", .data = @embedFile("themes/rose.json") },
+    .{ .file = "graphite.json", .data = @embedFile("themes/graphite.json") },
 };
+
+/// Copies the built-in themes to `<root>/themes/` so they can be read,
+/// copied and edited. Only when that directory does not exist yet: files
+/// the user deleted or changed later stay that way (a same-id file there
+/// replaces the built-in anyway).
+pub fn seedBuiltIns(io: std.Io, root: []const u8) void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = std.fmt.bufPrint(&buf, "{s}/{s}", .{ root, user_dirs[0][0] }) catch return;
+    if (std.Io.Dir.cwd().access(io, dir, .{})) return else |_| {}
+    std.Io.Dir.cwd().createDirPath(io, dir) catch return;
+    for (built_in) |b| {
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&pbuf, "{s}/{s}", .{ dir, b.file }) catch continue;
+        std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = b.data }) catch {};
+    }
+}
 
 fn parse(arena: std.mem.Allocator, data: []const u8) ?Def {
     return std.json.parseFromSliceLeaky(Def, arena, data, .{ .ignore_unknown_fields = true, .allocate = .alloc_always }) catch null;
@@ -346,7 +365,7 @@ fn loadDir(arena: std.mem.Allocator, io: std.Io, list: *std.ArrayList(Def), root
 /// in `arena`.
 pub fn loadAll(arena: std.mem.Allocator, io: std.Io, dir: ?[]const u8) []const Def {
     var list: std.ArrayList(Def) = .empty;
-    for (built_in) |data| if (parse(arena, data)) |d| put(arena, &list, d);
+    for (built_in) |b| if (parse(arena, b.data)) |d| put(arena, &list, d);
     if (dir) |root| for (user_dirs) |sub| loadDir(arena, io, &list, root, sub);
     return list.items;
 }
@@ -443,4 +462,23 @@ test "user themes load from the themes directory; a same-id file replaces a buil
     try std.testing.expectEqualStrings("Extra", find(defs, "extra").?.name);
     try std.testing.expectEqualStrings("My Ocean", find(defs, "ocean").?.name);
     try std.testing.expect(find(defs, "broken") == null);
+}
+
+test "built-ins are seeded once, and never over what is there" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [128]u8 = undefined;
+    const root = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/lax", .{tmp.sub_path});
+    seedBuiltIns(io, root);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    try std.testing.expectEqual(built_in.len, loadAll(arena, io, root).len);
+    // A deleted file stays deleted, an edited one stays edited
+    try tmp.dir.deleteFile(io, "lax/themes/rose.json");
+    try tmp.dir.writeFile(io, .{ .sub_path = "lax/themes/ocean.json", .data = "{\"name\":\"Mine\"}" });
+    seedBuiltIns(io, root);
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(io, "lax/themes/rose.json", .{}));
+    try std.testing.expectEqualStrings("Mine", find(loadAll(arena, io, root), "ocean").?.name);
 }

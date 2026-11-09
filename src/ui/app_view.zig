@@ -778,6 +778,7 @@ pub const State = struct {
         s.applied_ui_font = keep.dupe(u8, s.applied_ui_font) catch "";
         s.applied_chat_font = keep.dupe(u8, s.applied_chat_font) catch "";
         _ = s.themes_arena.reset(.free_all);
+        if (s.layout_dir) |dir| theme.seedBuiltIns(s.io, dir);
         s.themes = theme.loadAll(s.themes_arena.allocator(), s.io, s.layout_dir);
     }
 
@@ -971,21 +972,46 @@ pub const State = struct {
         }
     }
 
-    /// The themes as cards, three to a row; the id of the one clicked
+    /// The themes as cards, three to a row, after a tile that rereads the
+    /// theme directories; the id of the one clicked
     fn themeGrid(s: *State, c: *ui.Context) ?[]const u8 {
         var picked: ?[]const u8 = null;
+        var refresh = false;
         const col = ui.div(c).column().gap(12);
-        defer col.end();
         const current = if (s.activeTheme()) |d| d.id else theme.default_id;
+        // The refresh tile takes the first slot
+        const total = s.themes.len + 1;
         var i: usize = 0;
-        while (i < s.themes.len) : (i += 3) {
+        while (i < total) : (i += 3) {
             const row = ui.div(c).row().gap(12);
-            defer row.end();
-            for (s.themes[i..@min(i + 3, s.themes.len)]) |*d| {
+            for (i..@min(i + 3, total)) |slot| {
+                if (slot == 0) {
+                    refresh = s.refreshCard(c);
+                    continue;
+                }
+                const d = &s.themes[slot - 1];
                 if (s.themeCard(c, d, std.mem.eql(u8, d.id, current))) picked = d.id;
             }
+            row.end();
+        }
+        col.end();
+        // After the loop: reloading frees the themes the cards pointed at
+        if (refresh) {
+            const keep = if (picked) |id| s.settings_arena.allocator().dupe(u8, id) catch null else null;
+            s.loadThemes();
+            return keep;
         }
         return picked;
+    }
+
+    /// A fake theme tile: click to reread the system and custom theme directories
+    fn refreshCard(s: *State, c: *ui.Context) bool {
+        ui.key(c, "theme-refresh");
+        const card = ui.div(c).column().w(136).h(84).p(12).gap(6).center().rounded(12).bg(s.pal.container_high.alpha(0.5)).border(c.theme.border).borderW(1).control().hover(c.theme.surface_hover);
+        defer card.end();
+        ui.icon(c, "arrow.clockwise", .{ .size = 22, .frame = 26, .weight = .semibold, .color = c.theme.muted });
+        ui.text(c, "Refresh themes", .{ .size = 13, .color = c.theme.muted });
+        return card.clicked();
     }
 
     /// A theme's swatch in the current mode: its background, name and main colors

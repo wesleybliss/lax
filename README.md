@@ -53,7 +53,7 @@ Packaging and releases: see `packaging/README.md`.
 
 Settings > Appearance: Mode (System, Light, Dark; "System" follows the desktop and changes live) and Theme. The account menu has a quick Dark mode / Light mode toggle (it sets Mode).
 
-A theme is a JSON file in `~/.config/lax/custom/themes/` or `~/.config/lax/themes/` (the first wins on a clash; `$XDG_CONFIG_HOME/lax` if set). Settings rescans when it opens; the same `id` as a built-in replaces it. Everything is optional, colors are `#RGB`, `#RRGGBB` or `#RRGGBBAA`, unknown fields and bad colors are ignored. `colors` applies to both modes, then `light` or `dark` over it. A mode with no colors keeps the default look.
+A theme is a JSON file in `~/.config/lax/themes/` or `~/.config/lax/custom/themes/` (the second wins on a clash; `$XDG_CONFIG_HOME/lax` if set). The first run copies the built-in themes into `themes/` to copy and edit (it never touches that folder again). Settings rescans when it opens, and the first tile of the theme grid rescans on click; the same `id` as a built-in replaces it. Everything is optional, colors are `#RGB`, `#RRGGBB` or `#RRGGBBAA`, unknown fields and bad colors are ignored. `colors` applies to both modes, then `light` or `dark` over it. A mode with no colors keeps the default look.
 
 ```json
 {
