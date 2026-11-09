@@ -63,14 +63,122 @@ pub const clipboard = struct {
         return 0;
     }
 
-    /// Images on the clipboard: not read here yet.
-    pub fn readImage(_: std.mem.Allocator) !?[]u8 {
-        return null;
+    /// Whether the clipboard holds files (copied in the file manager).
+    /// GTK 4 only: GTK 3 reports none.
+    pub fn hasFiles() bool {
+        return gtk.v4 and has(gtk.v4api.gdk_file_list_get_type());
     }
 
-    /// Files on the clipboard: not read here yet.
-    pub fn readFiles(_: std.mem.Allocator) !?[][]u8 {
-        return null;
+    /// The image on the clipboard (a screenshot, an image copied from a
+    /// page or an app) as PNG, or null when it holds none. GTK 4 only.
+    /// Caller frees it.
+    pub fn readImage(gpa: std.mem.Allocator) !?[]u8 {
+        if (!gtk.v4 or !has(gtk.v4api.gdk_texture_get_type())) return null;
+        const g4 = &gtk.v4api;
+        const r = Wait.start(gpa) orelse return null;
+        g4.gdk_clipboard_read_texture_async(board() orelse return null, null, Wait.texture, r);
+        if (!r.wait()) return null;
+        defer r.finish();
+        const texture = r.result orelse return null;
+        defer gtk.api.g_object_unref(texture);
+        const blob = g4.gdk_texture_save_to_png_bytes(texture) orelse return null;
+        defer g4.g_bytes_unref(blob);
+        var len: usize = 0;
+        const data = g4.g_bytes_get_data(blob, &len) orelse return null;
+        return try gpa.dupe(u8, data[0..len]);
+    }
+
+    /// The paths of the files on the clipboard (copied in the file
+    /// manager), or null when it holds none. Free with `dialog.freePaths`.
+    pub fn readFiles(gpa: std.mem.Allocator) !?[][]u8 {
+        if (!gtk.v4 or !hasFiles()) return null;
+        const g4 = &gtk.v4api;
+        const r = Wait.start(gpa) orelse return null;
+        g4.gdk_clipboard_read_value_async(board() orelse return null, g4.gdk_file_list_get_type(), 0, null, Wait.files, r);
+        if (!r.wait()) return null;
+        defer r.finish();
+        if (r.failed or r.paths.items.len == 0) {
+            for (r.paths.items) |p| gpa.free(p);
+            return null;
+        }
+        return try r.paths.toOwnedSlice(gpa);
+    }
+};
+
+/// Whether the GTK 4 clipboard offers `kind` (a GType).
+fn has(kind: usize) bool {
+    if (!gtk.v4) return false;
+    const b = board() orelse return false;
+    return gtk.v4api.gdk_content_formats_contain_gtype(gtk.v4api.gdk_clipboard_get_formats(b), kind) != 0;
+}
+
+/// A GTK 4 clipboard read (of a picture or of files), waited for on GLib's
+/// loop, a second at most. The answer is taken in the callback: GDK frees a
+/// value with the read's result as soon as it returns.
+const Wait = struct {
+    gpa: std.mem.Allocator = undefined,
+    done: bool = false,
+    failed: bool = false,
+    /// The picture, owned by the caller
+    result: ?*anyopaque = null,
+    paths: std.ArrayList([]u8) = .empty,
+
+    fn texture(source: *anyopaque, result: *anyopaque, data: ?*anyopaque) callconv(.c) void {
+        const w: *Wait = @ptrCast(@alignCast(data));
+        w.result = gtk.v4api.gdk_clipboard_read_texture_finish(source, result, null);
+        w.done = true;
+    }
+
+    fn files(source: *anyopaque, result: *anyopaque, data: ?*anyopaque) callconv(.c) void {
+        const w: *Wait = @ptrCast(@alignCast(data));
+        defer w.done = true;
+        const g4 = &gtk.v4api;
+        const value = g4.gdk_clipboard_read_value_finish(source, result, null) orelse {
+            w.failed = true;
+            return;
+        };
+        const list = g4.g_value_get_boxed(value) orelse {
+            w.failed = true;
+            return;
+        };
+        const found = g4.gdk_file_list_get_files(list);
+        defer gtk.api.g_slist_free(found);
+        var node = found;
+        while (node) |n| : (node = n.next) {
+            const file = n.data orelse continue;
+            const name = g4.g_file_get_path(file) orelse continue;
+            defer gtk.api.g_free(name);
+            const copy = w.gpa.dupe(u8, std.mem.span(name)) catch {
+                w.failed = true;
+                return;
+            };
+            w.paths.append(w.gpa, copy) catch {
+                w.gpa.free(copy);
+                w.failed = true;
+                return;
+            };
+        }
+    }
+
+    /// On the heap: after a timeout the callback may still come, and it
+    /// writes here (the leak is that of one small struct)
+    fn start(gpa: std.mem.Allocator) ?*Wait {
+        const w = std.heap.c_allocator.create(Wait) catch return null;
+        w.* = .{ .gpa = gpa };
+        return w;
+    }
+
+    fn finish(w: *Wait) void {
+        w.paths.deinit(w.gpa);
+        std.heap.c_allocator.destroy(w);
+    }
+
+    fn wait(w: *Wait) bool {
+        var spins: usize = 0;
+        while (!w.done and spins < 1000) : (spins += 1) {
+            if (gtk.api.g_main_context_iteration(null, 0) == 0) std.Io.sleep(std.Io.Threaded.global_single_threaded.io(), .fromMilliseconds(1), .awake) catch {};
+        }
+        return w.done;
     }
 };
 

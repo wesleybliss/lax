@@ -80,3 +80,24 @@ family per window theme, fixed at window creation.
 **Why:** `surface.zig` sent these as plain `.backspace`, `.delete` and arrow keys, so Ctrl was dropped and a field only moved or deleted one character.
 
 **What:** `keyPress` turns them into the existing word commands (`delete_word_backward`, `delete_word_forward`, `move_word_left`/`right`, and the `select_` pair with Shift) while a text field has focus.
+
+## 8. `App.Options.app_id` sets the Wayland app id (Linux)
+
+**Why:** GTK uses the executable's name as the window's app id, so on GNOME/Wayland `lax` matched no desktop file (`com.gammagamma.lax.desktop`) and the shell showed the generic "GTK Application" label and icon.
+
+**What:** `linux/app.zig`: new `Options.app_id`, passed to `g_set_prgname` before GTK starts. `linux/gtk.zig`: the table gains `g_set_prgname`.
+
+## 9. `arrow.down.to.line` icon (Linux, Windows, Android)
+
+**Why:** the line-icon set has no download symbol, so a download button drew nothing there (macOS has the SF Symbol of this name).
+
+**What:** `ui/icons.zig`: one new entry, an arrow down onto a line.
+
+## 10. Pictures and files from the clipboard (Linux, GTK 4)
+
+**Why:** `clipboard.readImage` and `readFiles` were stubs on Linux, so a screenshot copied to the clipboard (GNOME's screenshot tool) could not be pasted. And files copied in the file manager also come as text (their names), which Ctrl+V pasted into the text field.
+
+**What:**
+- `linux/desktop.zig`: `readImage` (GDK texture from the clipboard, saved back as PNG), `readFiles` (a `GdkFileList` as paths), and `hasFiles`. GTK 3 still reports none. The reads are waited for on GLib's loop (a second at most) with the state on the heap, since GDK frees the file list's value as soon as the callback returns, and a late callback must not write to a dead stack frame.
+- `linux/gtk.zig`: the GTK 4 table gains the clipboard format, read and texture functions.
+- `linux/surface.zig`: Ctrl+V in a text field leaves files, and empty text, to the view (as with no text), which attaches them.

@@ -77,6 +77,11 @@ fn actionFetchImage(ctx: *anyopaque, id: []const u8, url: []const u8) void {
     net.fetchImage(id, url);
 }
 
+fn actionDownload(ctx: *anyopaque, name: []const u8, url: []const u8) void {
+    const net: *Net = @ptrCast(@alignCast(ctx));
+    net.download(name, url);
+}
+
 fn actionSend(ctx: *anyopaque, channel: []const u8, text: []const u8, thread_ts: ?[]const u8) void {
     const net: *Net = @ptrCast(@alignCast(ctx));
     net.send(channel, text, thread_ts);
@@ -183,6 +188,7 @@ fn run(init: std.process.Init, relaunch_path: *?[]const u8) !void {
         .send = actionSend,
         .upload = actionUpload,
         .fetch_image = actionFetchImage,
+        .download = actionDownload,
         .older = actionOlder,
         .open_thread = actionOpenThread,
         .react = actionReact,
@@ -231,7 +237,7 @@ fn run(init: std.process.Init, relaunch_path: *?[]const u8) !void {
 
     var pump: Pump = .{ .gpa = gpa, .io = init.io, .st = &st, .net = &net, .wake = &wake, .state = &state };
 
-    const nano = try nanoui.App.create(init, .{ .name = "Lax" });
+    const nano = try nanoui.App.create(init, .{ .name = "Lax", .app_id = "com.gammagamma.lax" });
     defer nano.destroy();
     const window = try nano.newWindow(.{
         .title = "Lax",

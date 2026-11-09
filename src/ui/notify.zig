@@ -39,8 +39,9 @@ pub fn send(gpa: std.mem.Allocator, io: std.Io, title: []const u8, text: []const
         .macos => &.{ "osascript", "-e", "on run argv", "-e", "display notification (item 1 of argv) with title (item 2 of argv)", "-e", "end run", "--", text, title },
         .windows => windowsArgv(arena, title, text) catch return,
         // `sh -c '... &' _ ARGS` backgrounds the notifier so nothing is left to reap. Its body is
-        // markup, so what Slack sent as text is escaped; `--` ends options for a title like "-x"
-        else => &.{ "sh", "-c", "notify-send --app-name=Lax --icon=com.gammagamma.lax --hint=string:desktop-entry:com.gammagamma.lax -- \"$1\" \"$2\" >/dev/null 2>&1 &", "lax-notify", title, escapeMarkup(arena, text) catch return },
+        // markup, so what Slack sent as text is escaped; `--` ends options for a title like "-x".
+        // No `desktop-entry` hint: with it GNOME Shell drops the banner (see scripts/notify-debug.sh)
+        else => &.{ "sh", "-c", "notify-send --app-name=Lax --icon=com.gammagamma.lax -- \"$1\" \"$2\" >/dev/null 2>&1 &", "lax-notify", title, escapeMarkup(arena, text) catch return },
     };
     const result = std.process.run(gpa, io, .{ .argv = argv }) catch return;
     gpa.free(result.stdout);

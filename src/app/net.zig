@@ -6,6 +6,8 @@ const slack = @import("slack");
 const store = @import("store");
 
 const state_file = @import("state_file.zig");
+const image_cache = @import("image_cache.zig");
+const downloads = @import("downloads.zig");
 
 const json = slack.jsonutil;
 
@@ -17,6 +19,8 @@ pub const Command = union(enum) {
     upload: struct { channel: []u8, text: []u8, thread_ts: ?[]u8, paths: [][]u8 },
     /// Download a file's preview picture (`url` is private to the workspace)
     fetch_image: struct { id: []u8, url: []u8 },
+    /// Save a file in the downloads folder (`url` is private to the workspace)
+    download: struct { name: []u8, url: []u8 },
     /// Load the page of messages before `before`
     older: struct { channel: []u8, before: []u8 },
     open_thread: struct { channel: []u8, ts: []u8 },
@@ -59,6 +63,10 @@ pub const Command = union(enum) {
             },
             .fetch_image => |m| {
                 gpa.free(m.id);
+                gpa.free(m.url);
+            },
+            .download => |m| {
+                gpa.free(m.name);
                 gpa.free(m.url);
             },
             .older => |m| {
@@ -109,6 +117,11 @@ pub const Command = union(enum) {
 
 /// Largest file read into memory to upload (one buffer: the file and its form)
 const upload_max = 256 << 20;
+
+/// Largest file a download holds in memory
+const download_max = 128 << 20;
+/// Largest full-size picture shown in the preview
+const full_image_max = 32 << 20;
 
 /// Offline for longer than this: fetch conversations and users again
 const full_refresh_ms = 5 * 60 * 1000;
@@ -163,6 +176,8 @@ pub const Net = struct {
     /// Last used team from the state file (arena-owned by `run`)
     last_team: []const u8 = "",
     config_dir: ?[]const u8 = null,
+    /// Where downloaded pictures are kept (null: nowhere)
+    cache_dir: ?[]const u8 = null,
     /// Set once a session got through bootstrap (the credentials work)
     bootstrapped: bool = false,
     self_id: []u8 = &.{},
@@ -245,6 +260,18 @@ pub const Net = struct {
         };
         n.commands.push(n.gpa, n.io, .{ .fetch_image = .{ .id = i, .url = u } }) catch {
             n.gpa.free(i);
+            n.gpa.free(u);
+        };
+    }
+
+    pub fn download(n: *Net, name: []const u8, url: []const u8) void {
+        const nm = n.gpa.dupe(u8, name) catch return;
+        const u = n.gpa.dupe(u8, url) catch {
+            n.gpa.free(nm);
+            return;
+        };
+        n.commands.push(n.gpa, n.io, .{ .download = .{ .name = nm, .url = u } }) catch {
+            n.gpa.free(nm);
             n.gpa.free(u);
         };
     }
@@ -358,6 +385,7 @@ pub const Net = struct {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
         n.config_dir = state_file.configDir(arena, n.env) catch null;
+        n.cache_dir = state_file.cacheDir(arena, n.env) catch null;
         if (n.config_dir) |d| n.last_team = state_file.load(arena, n.io, d).last_team;
         defer {
             if (n.creds) |*c| c.deinit();
@@ -1129,24 +1157,61 @@ pub const Net = struct {
         };
     }
 
-    /// A file's preview, for the message that shows it
+    /// A file's preview (or full-size picture, or a profile picture), for the
+    /// message that shows it: from the disk cache when it is there
     fn fetchFileImage(n: *Net, api: *slack.http.Api, id: []const u8, url: []const u8) void {
         n.dbg("fetching file preview {s}", .{id});
         var item_arena = std.heap.ArenaAllocator.init(n.gpa);
         const ia = item_arena.allocator();
-        if (std.mem.startsWith(u8, id, store.avatar_prefix)) {
-            // A profile picture: a public URL, so no session credentials go with it
-            const bytes = api.download(ia, url, 1 << 20) catch return item_arena.deinit();
+        const is_avatar = std.mem.startsWith(u8, id, store.avatar_prefix);
+        const limit: usize = if (is_avatar) 1 << 20 else if (std.mem.startsWith(u8, id, store.full_prefix)) full_image_max else 8 << 20;
+        const bytes = n.cachedImage(ia, url, limit) orelse blk: {
+            // A profile picture is a public URL, so no session credentials go with it
+            const got = (if (is_avatar) api.download(ia, url, limit) else api.downloadPrivate(ia, url, limit)) catch |err| {
+                n.dbg("file preview failed: {s}", .{@errorName(err)});
+                return item_arena.deinit();
+            };
+            if (n.cache_dir) |d| image_cache.put(n.gpa, n.io, d, url, got);
+            break :blk got;
+        };
+        n.dbg("file preview {s}: {d} bytes", .{ id, bytes.len });
+        if (is_avatar) {
             const user = ia.dupe(u8, id[store.avatar_prefix.len..]) catch return item_arena.deinit();
             return n.emit(.{ .arena = item_arena, .update = .{ .avatar = .{ .user = user, .bytes = bytes } } });
         }
-        const bytes = api.downloadPrivate(ia, url, 8 << 20) catch |err| {
-            n.dbg("file preview failed: {s}", .{@errorName(err)});
-            return item_arena.deinit();
-        };
-        n.dbg("file preview {s}: {d} bytes", .{ id, bytes.len });
         const copy_id = ia.dupe(u8, id) catch return item_arena.deinit();
         n.emit(.{ .arena = item_arena, .update = .{ .file_image = .{ .id = copy_id, .bytes = bytes } } });
+    }
+
+    fn cachedImage(n: *Net, arena: std.mem.Allocator, url: []const u8, limit: usize) ?[]u8 {
+        const dir = n.cache_dir orelse return null;
+        return image_cache.get(arena, n.io, dir, url, limit);
+    }
+
+    /// Saves a file in the downloads folder and tells the user where
+    fn downloadFile(n: *Net, api: *slack.http.Api, name: []const u8, url: []const u8) void {
+        var tmp = std.heap.ArenaAllocator.init(n.gpa);
+        defer tmp.deinit();
+        const a = tmp.allocator();
+        const folder = (downloads.dir(a, n.io, n.env) catch null) orelse return n.emitToast("Could not find your Downloads folder", .{});
+        const bytes = n.cachedImage(a, url, download_max) orelse (api.downloadPrivate(a, url, download_max) catch |err| {
+            n.dbg("download failed: {s}", .{@errorName(err)});
+            return n.emitToast("Could not download the file ({s})", .{@errorName(err)});
+        });
+        const saved = downloads.save(a, n.io, folder, name, bytes) catch |err| {
+            n.dbg("saving failed: {s}", .{@errorName(err)});
+            return n.emitToast("Could not save the file ({s})", .{@errorName(err)});
+        };
+        n.emitToast("Saved to {s}", .{downloads.tilde(a, saved.path, n.env.get("HOME") orelse n.env.get("USERPROFILE"))});
+    }
+
+    fn emitToast(n: *Net, comptime fmt: []const u8, args: anytype) void {
+        var arena = std.heap.ArenaAllocator.init(n.gpa);
+        const msg = std.fmt.allocPrint(arena.allocator(), fmt, args) catch {
+            arena.deinit();
+            return;
+        };
+        n.emit(.{ .arena = arena, .update = .{ .toast = msg } });
     }
 
     fn markRead(n: *Net, api: *slack.http.Api, channel: []const u8, ts: []const u8) void {
@@ -1343,6 +1408,7 @@ pub const Net = struct {
                     .quit => return,
                     .send => |m| try n.postMessage(api, m.channel, m.text, m.thread_ts),
                     .fetch_image => |m| n.fetchFileImage(api, m.id, m.url),
+                    .download => |m| n.downloadFile(api, m.name, m.url),
                     .upload => |m| try n.uploadFiles(api, m.channel, m.text, m.thread_ts, m.paths),
                     .mark => |m| n.markRead(api, m.channel, m.ts),
                     .presence => |away| n.callPresence(api, away),
@@ -1757,6 +1823,7 @@ fn fileInfos(arena: std.mem.Allocator, files: []const std.json.Value) std.mem.Al
             .name = try arena.dupe(u8, json.str(f, "name") orelse json.str(f, "title") orelse "file"),
             .mimetype = try arena.dupe(u8, json.str(f, "mimetype") orelse ""),
             .link = try arena.dupe(u8, json.str(f, "permalink") orelse ""),
+            .url = try arena.dupe(u8, json.str(f, "url_private") orelse ""),
         };
         // The preview a message shows: 360 wide, as Slack's own does
         if (json.str(f, "thumb_360")) |url| {

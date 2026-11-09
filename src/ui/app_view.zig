@@ -58,9 +58,32 @@ const file_gap: f32 = 6;
 const file_chip_h: f32 = 36;
 /// Largest an image preview is drawn
 const file_max: f32 = 300;
+/// Layers of the picture viewer: over the message toolbar's (20) and the dialogs'
+const viewer_layer_back = 40;
+const viewer_layer_front = 41;
+const viewer_bar_h: f32 = 52;
 /// Hover toolbar: its buttons, and how many recent emoji it shows
 const bar_btn: f32 = 30;
 const bar_recent = 3;
+/// A file's hover menu: one button
+const download_bar_w: f32 = bar_btn + 6;
+const download_bar_h: f32 = bar_btn + 4;
+
+/// A file shown full size over the conversation (owned strings)
+const Preview = struct {
+    id: []u8,
+    name: []u8,
+    /// Its bytes (private to the workspace), and its page in the browser
+    url: []u8,
+    link: []u8,
+
+    fn deinit(p: Preview, gpa: std.mem.Allocator) void {
+        gpa.free(p.id);
+        gpa.free(p.name);
+        gpa.free(p.url);
+        gpa.free(p.link);
+    }
+};
 
 /// What the UI asks of the network side
 pub const Actions = struct {
@@ -85,6 +108,8 @@ pub const Actions = struct {
     set_presence: *const fn (ctx: *anyopaque, away: bool) void,
     /// Download a file's preview picture (id, its private URL)
     fetch_image: *const fn (ctx: *anyopaque, id: []const u8, url: []const u8) void,
+    /// Save a file in the downloads folder (its name, its private URL); the answer is `store.toast`
+    download: *const fn (ctx: *anyopaque, name: []const u8, url: []const u8) void,
     /// Load (or refresh) one of the top-row pages
     load_feed: *const fn (ctx: *anyopaque, kind: store.FeedKind) void,
     /// Download and install the announced app update (`store.app_update`)
@@ -209,6 +234,8 @@ pub const State = struct {
     main_composer: composer_mod.Composer,
     /// Files dropped on the conversation, and on the thread panel
     main_attach: attachments.Pending,
+    /// The picture open in the viewer over the conversation
+    preview: ?Preview = null,
     /// Files whose preview was asked for
     images_asked: std.StringHashMapUnmanaged(void) = .empty,
     thread_attach: attachments.Pending,
@@ -294,6 +321,7 @@ pub const State = struct {
     }
 
     pub fn deinit(s: *State) void {
+        s.closePreview();
         s.list.deinit();
         s.main_composer.deinit();
         s.main_attach.deinit();
@@ -338,6 +366,7 @@ pub const State = struct {
         s.store.closeThread();
         s.cancelEdit();
         s.menu.closeAll();
+        s.closePreview();
         s.dropImages();
         if (s.store.channel(id)) |c| c.unread = false;
         s.actions.open(s.actions.ctx, id);
@@ -363,6 +392,7 @@ pub const State = struct {
     /// except for what the user is looking at right now
     pub fn announce(s: *State) void {
         s.announceUpdateCheck();
+        s.announceToast();
         defer s.store.clearNotices();
         if (s.store.notices.items.len == 0) return;
         const focused = if (s.window) |w| w.isFocused() else true;
@@ -376,6 +406,14 @@ pub const State = struct {
             const title = if (several) std.fmt.allocPrint(a, "{s} · {s}", .{ n.title, n.team }) catch n.title else n.title;
             s.notifier(s.gpa, s.io, title, text);
         }
+    }
+
+    /// Shows what the network side wants said (where a download went, why it failed)
+    fn announceToast(s: *State) void {
+        const text = s.store.toast orelse return;
+        s.store.toast = null;
+        defer s.store.gpa.free(text);
+        s.toast(text);
     }
 
     /// Says how the user's "Check for updates" went
@@ -530,6 +568,7 @@ pub const State = struct {
             s.threadPanel(c);
         }
         s.messageOverlays(c);
+        s.previewOverlay(c);
         s.toaster.view(c);
 
         defer s.pending_thread = null;
@@ -1523,7 +1562,7 @@ pub const State = struct {
             s.dmAvatar(c, ch, name);
         } else ui.text(c, prefix, .{ .size = if (ch.kind == .channel) 17 else 13, .color = tone });
         icon.end();
-        const weight: ui.Weight = if (ch.unread) .bold else if (is_sel) .semibold else .regular;
+        const weight: ui.Weight = if (ch.unread) .bold else .regular;
         ui.text(c, if (name.len == 0) ch.id else name, .{ .size = 15, .weight = weight, .color = tone, .truncate = .ellipsis });
         if (s.store.isSelfDm(ch)) ui.text(c, "you", .{ .size = 13, .color = c.theme.muted });
         ui.spacer(c);
@@ -1660,17 +1699,23 @@ pub const State = struct {
         if (hovered or s.menu.holdsToolbar(channel_id, m.ts, in_thread)) if (row_it.rect) |rect| s.toolbar(c, rect, m, channel_id, in_thread);
     }
 
-    /// An attached file: an image's preview under its name, anything else as
-    /// a chip. Either opens the file in the browser.
+    /// An attached file: an image's preview under its name (a click opens it
+    /// in the viewer), anything else as a chip (a click opens it in the
+    /// browser). Either shows a download button while the pointer is on it.
     fn drawFile(s: *State, c: *ui.Context, f: store.FileInfo) void {
         if (f.thumb_w == 0 or f.thumb_h == 0) {
             const wrap = ui.div(c).column().h(fileHeight(f));
             defer wrap.end();
             const chip = ui.div(c).row().itemsCenter().gap(8).h(file_chip_h).maxW(file_max).px(12).rounded(10).control().bg(s.pal.container_high).border(c.theme.border).borderW(1).hover(c.theme.surface_hover);
             defer chip.end();
-            if (chip.clicked() and f.link.len > 0) s.opener(s.gpa, s.io, f.link);
+            const it = chip.interaction();
             ui.text(c, "📎", .{ .size = 14 });
             ui.text(c, f.name, .{ .size = 14, .truncate = .ellipsis });
+            var downloaded = false;
+            if (it.hovered and f.url.len > 0) if (it.rect) |r| {
+                downloaded = s.fileBar(c, r.x + r.w - download_bar_w - 4, r.y + (r.h - download_bar_h) / 2, f);
+            };
+            if (it.clicked and !downloaded and f.link.len > 0) s.opener(s.gpa, s.io, f.link);
             return;
         }
         const size = previewSize(f);
@@ -1681,10 +1726,117 @@ pub const State = struct {
         label.end();
         const frame = ui.div(c).w(size.w).h(size.h).rounded(8).control().bg(s.pal.container_high);
         defer frame.end();
-        if (frame.clicked() and f.link.len > 0) s.opener(s.gpa, s.io, f.link);
+        const it = frame.interaction();
         if (s.store.fileImage(f.id)) |bytes| {
             _ = ui.image(c, .{ .key = f.id, .bytes = bytes, .max_width = size.w, .max_height = size.h, .radius = 8, .scale = 1 });
         } else s.wantImage(f);
+        var downloaded = false;
+        if (it.hovered and f.url.len > 0) if (it.rect) |r| {
+            downloaded = s.fileBar(c, r.x + r.w - download_bar_w - 6, r.y + 6, f);
+        };
+        if (it.clicked and !downloaded) s.openPreview(f);
+    }
+
+    /// The hover menu of a file, at (`x`, `y`): a download button. True when it was clicked.
+    fn fileBar(s: *State, c: *ui.Context, x: f32, y: f32, f: store.FileInfo) bool {
+        const bar = ui.div(c).row().fixed().offset(@max(0, x), y).layer(20).w(download_bar_w).h(download_bar_h).itemsCenter().justifyCenter().rounded(10).bg(s.pal.container_high).border(c.theme.border).borderW(1).shadow(.{ .color = c.theme.border.alpha(0.6), .blur = 8, .y = 2 });
+        defer bar.end();
+        if (s.barIcon(c, "arrow.down.to.line", "Download") == null) return false;
+        s.download(f);
+        return true;
+    }
+
+    /// Saves a file in the downloads folder; the network side says when it is done
+    fn download(s: *State, f: store.FileInfo) void {
+        if (f.url.len == 0) return;
+        s.actions.download(s.actions.ctx, f.name, f.url);
+        s.toast("Downloading…");
+    }
+
+    // The picture viewer
+
+    /// Opens an image full size over the conversation; the full picture is
+    /// asked for, and the preview shows until it arrives
+    fn openPreview(s: *State, f: store.FileInfo) void {
+        s.closePreview();
+        const id = s.gpa.dupe(u8, f.id) catch return;
+        const name = s.gpa.dupe(u8, f.name) catch return s.gpa.free(id);
+        const url = s.gpa.dupe(u8, f.url) catch {
+            s.gpa.free(id);
+            s.gpa.free(name);
+            return;
+        };
+        const link = s.gpa.dupe(u8, f.link) catch {
+            s.gpa.free(id);
+            s.gpa.free(name);
+            s.gpa.free(url);
+            return;
+        };
+        s.preview = .{ .id = id, .name = name, .url = url, .link = link };
+        if (url.len == 0) return;
+        const key = std.fmt.allocPrint(s.gpa, "{s}{s}", .{ store.full_prefix, id }) catch return;
+        if (s.store.fileImage(key) != null) return s.gpa.free(key);
+        // Asked before and it never came (it failed): ask again
+        if (s.images_asked.fetchRemove(key)) |old| s.gpa.free(old.key);
+        s.images_asked.put(s.gpa, key, {}) catch return s.gpa.free(key);
+        s.actions.fetch_image(s.actions.ctx, key, url);
+    }
+
+    fn closePreview(s: *State) void {
+        const p = s.preview orelse return;
+        s.preview = null;
+        p.deinit(s.gpa);
+    }
+
+    /// The viewer: the picture on a dimmed page, with its name and buttons
+    /// (download, open in the browser, close) above. Esc, ✕ or a click
+    /// outside the picture closes it.
+    fn previewOverlay(s: *State, c: *ui.Context) void {
+        const p = s.preview orelse return;
+        if (c.shortcut(.{ .key = ui.Shortcut.escape })) return s.closePreview();
+        const back = ui.div(c).fixed().w(c.size.w).h(c.size.h).layer(viewer_layer_back).bg(ui.Color.black.alpha(0.92));
+        const back_it = back.interaction();
+        back.end();
+        var close = back_it.clicked;
+        {
+            const stage = ui.div(c).column().fixed().w(c.size.w).h(c.size.h).layer(viewer_layer_front);
+            defer stage.end();
+            {
+                const bar = ui.div(c).row().wFull().h(viewer_bar_h).itemsCenter().gap(8).px(16);
+                defer bar.end();
+                ui.text(c, p.name, .{ .size = 15, .weight = .semibold, .color = ui.Color.white, .truncate = .ellipsis });
+                ui.spacer(c);
+                if (p.url.len > 0 and viewerButton(c, "arrow.down.to.line", "Download")) s.download(.{ .id = p.id, .name = p.name, .url = p.url });
+                if (p.link.len > 0 and viewerButton(c, "globe", "Open in browser")) s.opener(s.gpa, s.io, p.link);
+                if (viewerButton(c, "xmark", "Close")) close = true;
+            }
+            const area = ui.div(c).wFull().grow().center().px(24).pb(24);
+            defer area.end();
+            const max_w = @max(40, c.size.w - 48);
+            const max_h = @max(40, c.size.h - viewer_bar_h - 24);
+            const holder = ui.div(c).center();
+            defer holder.end();
+            // The picture takes clicks so they do not close the viewer
+            _ = holder.interaction();
+            const full_key = c.print("{s}{s}", .{ store.full_prefix, p.id });
+            var shown = false;
+            if (s.store.fileImage(full_key)) |bytes| shown = ui.image(c, .{ .key = full_key, .bytes = bytes, .max_width = max_w, .max_height = max_h, .radius = 6, .scale = 1 });
+            if (!shown) if (s.store.fileImage(p.id)) |bytes| {
+                shown = ui.image(c, .{ .key = p.id, .bytes = bytes, .max_width = max_w, .max_height = max_h, .radius = 6, .scale = 1 });
+            };
+            if (!shown) ui.text(c, "Loading…", .{ .size = 14, .color = ui.Color.white.alpha(0.7) });
+        }
+        if (close) s.closePreview();
+    }
+
+    /// A button on the viewer's dark bar; true when clicked
+    fn viewerButton(c: *ui.Context, icon: []const u8, tip: []const u8) bool {
+        const btn = ui.div(c).w(36).h(36).center().rounded(8).control().hover(ui.Color.white.alpha(0.18));
+        defer btn.end();
+        const it = btn.interaction();
+        kit.tooltip(c, it, tip, .{ .placement = .bottom });
+        ui.icon(c, icon, .{ .size = 18, .frame = 22, .weight = .semibold, .color = ui.Color.white });
+        return it.clicked;
     }
 
     /// The conversation changed: the previews held go, and can be asked for again
@@ -1966,6 +2118,7 @@ pub const State = struct {
             c.end();
         }
         if (s.editing) |e| if (e.in_thread) return s.editBar(c, e, 16);
+        s.pasteAttachment(c, &s.thread_composer, &s.thread_attach);
         s.thread_attach.view(c, s.pal);
         const bar = ui.div(c).row().wFull().px(16).py(12);
         defer bar.end();
@@ -2037,6 +2190,7 @@ pub const State = struct {
 
     fn composer(s: *State, c: *ui.Context) void {
         if (s.editing) |e| if (!e.in_thread) return s.editBar(c, e, 20);
+        s.pasteAttachment(c, &s.main_composer, &s.main_attach);
         s.main_attach.view(c, s.pal);
         const bar = ui.div(c).row().wFull().px(20).pb(16);
         defer bar.end();
@@ -2062,6 +2216,15 @@ pub const State = struct {
             s.actions.upload(s.actions.ctx, channel, text, thread_ts, files.paths());
             files.clear();
         }
+    }
+
+    /// Ctrl+V (⌘V on a Mac) in `box` with no text on the clipboard: the
+    /// window passes it on, and a picture or files copied go to `into`.
+    /// Only while the box has the focus: the other box must not take it.
+    fn pasteAttachment(s: *State, c: *ui.Context, box: *const composer_mod.Composer, into: *attachments.Pending) void {
+        if (box.buf.last_id == 0 or c.focus != box.buf.last_id) return;
+        if (!c.shortcut(.{ .key = 'v', .ctrl = true }) and !c.shortcut(.{ .key = 'v', .cmd = true })) return;
+        _ = into.paste(s.io, s.cache_dir);
     }
 
     /// Box `index` takes files dropped from the file manager (into `into`),

@@ -1,5 +1,6 @@
-//! Files dropped on the window, waiting to go with the next message: kept as
-//! paths, shown as chips above the message box. Nothing is read until sent.
+//! Files dropped or pasted on the window, waiting to go with the next
+//! message: kept as paths, shown as chips above the message box. Nothing is
+//! read until sent. A pasted picture is saved in the cache first.
 const std = @import("std");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
@@ -52,6 +53,37 @@ pub const Pending = struct {
         }
     }
 
+    /// Ctrl+V with no text on the clipboard: the files copied in a file
+    /// manager (attached where they are), else a picture (a screenshot),
+    /// saved as a PNG in `cache_dir`. True if something was attached.
+    pub fn paste(p: *Pending, io: std.Io, cache_dir: ?[]const u8) bool {
+        if (nanoui.clipboard.readFiles(p.gpa) catch null) |files| {
+            defer nanoui.dialog.freePaths(p.gpa, files);
+            const before = p.items.items.len;
+            for (files) |path| p.addPath(path);
+            return p.items.items.len > before;
+        }
+        const dir = cache_dir orelse return false;
+        const png = nanoui.clipboard.readImage(p.gpa) catch null orelse return false;
+        defer p.gpa.free(png);
+        const path = savePicture(p.gpa, io, dir, png) orelse return false;
+        if (p.items.items.len >= max_files or p.has(path)) {
+            p.gpa.free(path);
+            return false;
+        }
+        p.items.append(p.gpa, path) catch {
+            p.gpa.free(path);
+            return false;
+        };
+        return true;
+    }
+
+    fn addPath(p: *Pending, path: []const u8) void {
+        if (p.items.items.len >= max_files or p.has(path)) return;
+        const owned = p.gpa.dupe(u8, path) catch return;
+        p.items.append(p.gpa, owned) catch p.gpa.free(owned);
+    }
+
     fn has(p: *const Pending, path: []const u8) bool {
         for (p.items.items) |have| if (std.mem.eql(u8, have, path)) return true;
         return false;
@@ -81,6 +113,44 @@ pub const Pending = struct {
         if (remove) |i| p.removeAt(i);
     }
 };
+
+const pasted_dir = "pasted";
+/// Pasted pictures older than this are deleted when another is pasted
+const pasted_max_age_ns: i96 = 7 * 24 * 60 * 60 * std.time.ns_per_s;
+
+fn privateMode() std.Io.File.Permissions {
+    return if (@hasDecl(std.Io.File.Permissions, "fromMode")) .fromMode(0o600) else .default_file;
+}
+
+/// Writes `png` as `<cache_dir>/pasted/clipboard-<unix ms>.png` and deletes
+/// the old ones there. The path is owned by the caller; null on failure.
+fn savePicture(gpa: std.mem.Allocator, io: std.Io, cache_dir: []const u8, png: []const u8) ?[]u8 {
+    const dir = std.fs.path.join(gpa, &.{ cache_dir, pasted_dir }) catch return null;
+    defer gpa.free(dir);
+    std.Io.Dir.cwd().createDirPath(io, dir) catch return null;
+    const now = std.Io.Timestamp.now(io, .real);
+    sweep(io, dir, now);
+    var name: [48]u8 = undefined;
+    const file = std.fmt.bufPrint(&name, "clipboard-{d}.png", .{@divTrunc(now.nanoseconds, std.time.ns_per_ms)}) catch return null;
+    const path = std.fs.path.join(gpa, &.{ dir, file }) catch return null;
+    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = png, .flags = .{ .permissions = privateMode() } }) catch {
+        gpa.free(path);
+        return null;
+    };
+    return path;
+}
+
+/// Deletes what is in `dir` and was written more than a week before `now`
+fn sweep(io: std.Io, dir: []const u8, now: std.Io.Timestamp) void {
+    var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return;
+    defer d.close(io);
+    var it = d.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        const st = d.statFile(io, entry.name, .{}) catch continue;
+        if (now.nanoseconds - st.mtime.nanoseconds > pasted_max_age_ns) d.deleteFile(io, entry.name) catch {};
+    }
+}
 
 /// A file URL as a path (`file:///home/a%20b.png` is `/home/a b.png`), or
 /// null for anything else. Owned by the caller.
@@ -148,4 +218,24 @@ test "adding urls skips repeats, links and the eleventh file" {
     for (&many, &bufs, 0..) |*m, *buf, i| m.* = std.fmt.bufPrint(buf, "file:///f{d}.txt", .{i}) catch unreachable;
     p.addUrls(&many);
     try std.testing.expectEqual(@as(usize, max_files), p.items.items.len);
+}
+
+test "a pasted picture is saved, and only old ones are swept" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(root);
+    const path = savePicture(gpa, io, root, "png-bytes").?;
+    defer gpa.free(path);
+    try std.testing.expect(std.mem.endsWith(u8, path, ".png"));
+    try std.testing.expect(std.mem.startsWith(u8, std.fs.path.basename(path), "clipboard-"));
+    var buf: [16]u8 = undefined;
+    const got = try std.Io.Dir.cwd().readFile(io, path, &buf);
+    try std.testing.expectEqualStrings("png-bytes", got);
+    // A week and a day on, the picture is old; it goes with the next paste
+    const dir = std.fs.path.dirname(path).?;
+    sweep(io, dir, .{ .nanoseconds = std.Io.Timestamp.now(io, .real).nanoseconds + 8 * 24 * 60 * 60 * std.time.ns_per_s });
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, path, .{}));
 }

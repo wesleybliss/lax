@@ -168,8 +168,8 @@ pub fn textArea(c: *Context, buffer: *tf.TextBuffer, opts: AreaOptions) tf.Resul
             .left => tf.apply(buffer, e, .{ .command = if (c.input.shift) .select_left else .move_left }, field, c.clipboard, &result),
             .right => tf.apply(buffer, e, .{ .command = if (c.input.shift) .select_right else .move_right }, field, c.clipboard, &result),
             .up, .down => vertical(c, buffer.text(), style, w, e, k == .down, c.input.shift),
-            .home => tf.apply(buffer, e, .{ .command = .move_line_start }, field, c.clipboard, &result),
-            .end => tf.apply(buffer, e, .{ .command = .move_line_end }, field, c.clipboard, &result),
+            .home => tf.apply(buffer, e, .{ .command = if (c.input.shift) .select_line_start else .move_line_start }, field, c.clipboard, &result),
+            .end => tf.apply(buffer, e, .{ .command = if (c.input.shift) .select_line_end else .move_line_end }, field, c.clipboard, &result),
             .enter => if (newline) tf.apply(buffer, e, .{ .insert = "\n" }, field, c.clipboard, &result) else {
                 result.submitted = true;
             },

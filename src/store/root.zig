@@ -17,6 +17,8 @@ pub const Kind = enum { channel, private, im, mpim };
 
 /// A `fetch_image` id with this prefix asks for a user's profile picture (the rest is the user id)
 pub const avatar_prefix = "avatar:";
+/// A `fetch_image` id with this prefix asks for a file's full-size picture (the rest is the file id)
+pub const full_prefix = "full:";
 
 pub const User = struct {
     id: []const u8,
@@ -197,6 +199,8 @@ pub const FileInfo = struct {
     mimetype: []const u8 = "",
     /// Opens it in the browser
     link: []const u8 = "",
+    /// The file's bytes (private to the workspace): for the full-size picture and downloads
+    url: []const u8 = "",
     /// An image's preview picture (empty: none yet, or not an image) and its size
     thumb: []const u8 = "",
     thumb_w: u32 = 0,
@@ -309,6 +313,8 @@ pub const Update = union(enum) {
     /// The app itself: a newer release, and how installing it is going
     app_update: AppUpdate,
     update_check: UpdateCheck,
+    /// Something for the user to read briefly ("Saved to ~/Downloads/a.png")
+    toast: []const u8,
 };
 
 /// An update with the memory its slices point into
@@ -456,6 +462,8 @@ pub const Store = struct {
     app_update: ?AppUpdate = null,
     /// The answer to the user's "Check for updates", until the UI shows it
     update_check: ?UpdateCheck = null,
+    /// A message from the network side, until the UI shows it (owned)
+    toast: ?[]u8 = null,
     /// Other workspaces' data, by team id
     parked: std.StringHashMapUnmanaged(Space) = .empty,
     /// Files' preview pictures by file id (ids are unique across workspaces)
@@ -476,6 +484,7 @@ pub const Store = struct {
         s.clearAppUpdate();
         s.gpa.free(s.active_team);
         if (s.need_manual) |m| s.gpa.free(m);
+        if (s.toast) |t| s.gpa.free(t);
         s.clearTeams();
         s.teams.deinit(s.gpa);
         var shown = s.takeSpace();
@@ -613,7 +622,7 @@ pub const Store = struct {
     /// Applies an update the network side tagged with its workspace
     pub fn applyItem(s: *Store, item: *const Item) std.mem.Allocator.Error!void {
         switch (item.update) {
-            .teams, .need_manual, .manual_done, .app_update, .update_check => return s.apply(item.update),
+            .teams, .need_manual, .manual_done, .app_update, .update_check, .toast => return s.apply(item.update),
             else => {},
         }
         const tag = item.team();
@@ -653,7 +662,7 @@ pub const Store = struct {
     }
 
     fn freeFiles(s: *Store, files: []FileInfo) void {
-        for (files) |f| for ([_][]const u8{ f.id, f.name, f.mimetype, f.link, f.thumb }) |str| if (str.len > 0) s.gpa.free(str);
+        for (files) |f| for ([_][]const u8{ f.id, f.name, f.mimetype, f.link, f.url, f.thumb }) |str| if (str.len > 0) s.gpa.free(str);
         s.gpa.free(files);
     }
 
@@ -667,7 +676,7 @@ pub const Store = struct {
             out[made] = .{ .id = "", .name = "", .thumb_w = f.thumb_w, .thumb_h = f.thumb_h };
             made += 1;
             const dst = &out[made - 1];
-            inline for (.{ "id", "name", "mimetype", "link", "thumb" }) |field| {
+            inline for (.{ "id", "name", "mimetype", "link", "url", "thumb" }) |field| {
                 const src = @field(f, field);
                 if (src.len > 0) @field(dst, field) = try s.gpa.dupe(u8, src);
             }
@@ -971,6 +980,11 @@ pub const Store = struct {
             .connection => |v| s.connection = v,
             .status => |msg| try s.replace(&s.status, msg),
             .update_check => |r| s.update_check = r,
+            .toast => |text| {
+                const copy = try s.gpa.dupe(u8, text);
+                if (s.toast) |old| s.gpa.free(old);
+                s.toast = copy;
+            },
             .app_update => |info| {
                 const version = try s.gpa.dupe(u8, info.version);
                 errdefer s.gpa.free(version);

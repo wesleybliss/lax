@@ -228,6 +228,11 @@ const Fake = struct {
     upload_thread: bool = false,
     upload_files: usize = 0,
     image_calls: usize = 0,
+    image_last: [64]u8 = undefined,
+    image_last_len: usize = 0,
+    download_calls: usize = 0,
+    download_name: [64]u8 = undefined,
+    download_name_len: usize = 0,
     upload_first: [128]u8 = undefined,
     upload_first_len: usize = 0,
     react_name: [32]u8 = undefined,
@@ -258,6 +263,7 @@ const Fake = struct {
             .send = send,
             .upload = upload,
             .fetch_image = fetchImage,
+            .download = download,
             .older = older,
             .open_thread = openThread,
             .react = react,
@@ -320,9 +326,17 @@ const Fake = struct {
             f.upload_first_len = paths[0].len;
         }
     }
-    fn fetchImage(ctx: *anyopaque, _: []const u8, _: []const u8) void {
+    fn fetchImage(ctx: *anyopaque, id: []const u8, _: []const u8) void {
         const f: *Fake = @ptrCast(@alignCast(ctx));
         f.image_calls += 1;
+        f.image_last_len = @min(id.len, f.image_last.len);
+        @memcpy(f.image_last[0..f.image_last_len], id[0..f.image_last_len]);
+    }
+    fn download(ctx: *anyopaque, name: []const u8, _: []const u8) void {
+        const f: *Fake = @ptrCast(@alignCast(ctx));
+        f.download_calls += 1;
+        f.download_name_len = @min(name.len, f.download_name.len);
+        @memcpy(f.download_name[0..f.download_name_len], name[0..f.download_name_len]);
     }
     fn older(ctx: *anyopaque, _: []const u8, _: []const u8) void {
         const f: *Fake = @ptrCast(@alignCast(ctx));
@@ -1763,8 +1777,8 @@ test "files: an image shows under its name once its preview arrives, other files
         .user = "U2",
         .text = "testing files",
         .files = &.{
-            .{ .id = "F1", .name = "lounge.png", .mimetype = "image/png", .link = "https://acme.slack.com/files/F1", .thumb = "https://files.slack.com/t.png", .thumb_w = 120, .thumb_h = 80 },
-            .{ .id = "F2", .name = "report.pdf", .mimetype = "application/pdf", .link = "https://acme.slack.com/files/F2" },
+            .{ .id = "F1", .name = "lounge.png", .mimetype = "image/png", .link = "https://acme.slack.com/files/F1", .url = "https://files.slack.com/f1.png", .thumb = "https://files.slack.com/t.png", .thumb_w = 120, .thumb_h = 80 },
+            .{ .id = "F2", .name = "report.pdf", .mimetype = "application/pdf", .link = "https://acme.slack.com/files/F2", .url = "https://files.slack.com/f2.pdf" },
         },
     } } });
     var fake: Fake = .{};
@@ -1800,6 +1814,239 @@ test "files: an image shows under its name once its preview arrives, other files
     try t.clickText("report.pdf");
     t.frame();
     try std.testing.expect(last_link_len > 0);
+}
+
+/// A message with an image and a PDF, a state showing it, and the image's preview arrived
+fn seedFiles(gpa: std.mem.Allocator, st: *store.Store, fake: *Fake, state: *app_view.State, t: *ui.Tester) !void {
+    try seedStore(st);
+    try st.apply(.{ .message = .{ .channel = "C1", .message = .{
+        .ts = "1700000300.000100",
+        .user = "U2",
+        .text = "testing files",
+        .files = &.{
+            .{ .id = "F1", .name = "lounge.png", .mimetype = "image/png", .link = "https://acme.slack.com/files/F1", .url = "https://files.slack.com/f1.png", .thumb = "https://files.slack.com/t.png", .thumb_w = 120, .thumb_h = 80 },
+            .{ .id = "F2", .name = "report.pdf", .mimetype = "application/pdf", .link = "https://acme.slack.com/files/F2", .url = "https://files.slack.com/f2.pdf" },
+        },
+    } } });
+    state.* = app_view.State.init(gpa, std.testing.io, st, fake.actions());
+    state.preferred = "C1";
+    state.opener = fakeOpener;
+    last_link_len = 0;
+    try t.init(gpa, .init(state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    for (0..4) |_| t.frame();
+    const png = try solidPng(gpa, 120, 80);
+    defer gpa.free(png);
+    try st.apply(.{ .file_image = .{ .id = "F1", .bytes = png } });
+    t.frame();
+}
+
+fn solidPng(gpa: std.mem.Allocator, w: u32, h: u32) ![]const u8 {
+    const px = try gpa.alloc(u8, w * h * 4);
+    defer gpa.free(px);
+    for (0..w * h) |i| @memcpy(px[i * 4 ..][0..4], &[4]u8{ 0, 0, 255, 255 });
+    return ui.png.encode(gpa, .{ .bytes = px, .width = w, .height = h });
+}
+
+/// Where an image's picture is: under the name line of its label
+fn imagePoint(t: *ui.Tester, name: []const u8) !struct { x: f32, y: f32 } {
+    const r = t.findText(name) orelse return error.TextNotFound;
+    return .{ .x = r.x + 20, .y = r.y + 40 };
+}
+
+test "clicking an image opens the viewer in the app, not the browser" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state: app_view.State = undefined;
+    var t: ui.Tester = undefined;
+    try seedFiles(gpa, &st, &fake, &state, &t);
+    defer state.deinit();
+    defer t.deinit();
+    // The bytes of the preview were handed to the store (which copied them)
+    const thumb = st.fileImage("F1").?;
+    try std.testing.expect(thumb.len > 0);
+
+    const at = try imagePoint(&t, "lounge.png");
+    t.click(at.x, at.y);
+    for (0..3) |_| t.frame();
+    try std.testing.expect(state.preview != null);
+    try std.testing.expectEqual(@as(usize, 0), last_link_len);
+    // The full picture is asked for, by the file's id
+    try std.testing.expectEqualStrings("full:F1", fake.image_last[0..fake.image_last_len]);
+    try std.testing.expect(findLast(&t, "xmark") != null);
+    try std.testing.expect(findLast(&t, "globe") != null);
+    try std.testing.expect(findLast(&t, "arrow.down.to.line") != null);
+
+    // The full picture replaces the preview
+    const big = try solidPng(gpa, 800, 500);
+    defer gpa.free(big);
+    try st.apply(.{ .file_image = .{ .id = "full:F1", .bytes = big } });
+    for (0..3) |_| t.frame();
+    try t.screenshot("/tmp/lax-viewer.png");
+    try std.testing.expect(st.fileImage("full:F1") != null);
+
+    // The browser button
+    try clickLast(&t, "globe");
+    t.frame();
+    try std.testing.expectEqualStrings("https://acme.slack.com/files/F1", last_link[0..last_link_len]);
+    try std.testing.expect(state.preview != null);
+
+    // Esc closes it
+    _ = t.shortcut(.{ .key = ui.Shortcut.escape });
+    for (0..3) |_| t.frame();
+    try std.testing.expect(state.preview == null);
+    try std.testing.expect(findLast(&t, "globe") == null);
+
+    // So does the ✕, and a click on the dimmed page
+    t.click(at.x, at.y);
+    for (0..3) |_| t.frame();
+    try std.testing.expect(state.preview != null);
+    try clickLast(&t, "xmark");
+    for (0..3) |_| t.frame();
+    try std.testing.expect(state.preview == null);
+    t.click(at.x, at.y);
+    for (0..3) |_| t.frame();
+    try std.testing.expect(state.preview != null);
+    t.click(8, 630);
+    for (0..3) |_| t.frame();
+    try std.testing.expect(state.preview == null);
+}
+
+test "the viewer's picture takes clicks without closing it, its button downloads" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state: app_view.State = undefined;
+    var t: ui.Tester = undefined;
+    try seedFiles(gpa, &st, &fake, &state, &t);
+    defer state.deinit();
+    defer t.deinit();
+
+    const at = try imagePoint(&t, "lounge.png");
+    t.click(at.x, at.y);
+    for (0..3) |_| t.frame();
+    try std.testing.expect(state.preview != null);
+    // The middle of the window is the picture (the preview, centered)
+    t.click(500, 340);
+    for (0..3) |_| t.frame();
+    try std.testing.expect(state.preview != null);
+
+    try clickLast(&t, "arrow.down.to.line");
+    t.frame();
+    try std.testing.expectEqual(@as(usize, 1), fake.download_calls);
+    try std.testing.expectEqualStrings("lounge.png", fake.download_name[0..fake.download_name_len]);
+    try std.testing.expect(state.preview != null);
+}
+
+test "reopening the viewer asks again for a full picture that never came" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state: app_view.State = undefined;
+    var t: ui.Tester = undefined;
+    try seedFiles(gpa, &st, &fake, &state, &t);
+    defer state.deinit();
+    defer t.deinit();
+    const base = fake.image_calls;
+
+    const at = try imagePoint(&t, "lounge.png");
+    t.click(at.x, at.y);
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqual(base + 1, fake.image_calls);
+    _ = t.shortcut(.{ .key = ui.Shortcut.escape });
+    for (0..3) |_| t.frame();
+    t.click(at.x, at.y);
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqual(base + 2, fake.image_calls);
+
+    // Once it is here, opening again asks for nothing
+    const big = try solidPng(gpa, 400, 300);
+    defer gpa.free(big);
+    try st.apply(.{ .file_image = .{ .id = "full:F1", .bytes = big } });
+    _ = t.shortcut(.{ .key = ui.Shortcut.escape });
+    for (0..3) |_| t.frame();
+    t.click(at.x, at.y);
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqual(base + 2, fake.image_calls);
+}
+
+test "files show a download button on hover, and downloading is not opening" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state: app_view.State = undefined;
+    var t: ui.Tester = undefined;
+    try seedFiles(gpa, &st, &fake, &state, &t);
+    defer state.deinit();
+    defer t.deinit();
+
+    // No pointer on a file: no button
+    t.moveTo(5, 5);
+    for (0..3) |_| t.frame();
+    try std.testing.expect(findLast(&t, "arrow.down.to.line") == null);
+
+    // The image
+    const at = try imagePoint(&t, "lounge.png");
+    t.moveTo(at.x, at.y);
+    for (0..3) |_| t.frame();
+    try t.screenshot("/tmp/lax-file-hover.png");
+    try std.testing.expect(findLast(&t, "arrow.down.to.line") != null);
+    try clickLast(&t, "arrow.down.to.line");
+    for (0..2) |_| t.frame();
+    try std.testing.expectEqual(@as(usize, 1), fake.download_calls);
+    try std.testing.expectEqualStrings("lounge.png", fake.download_name[0..fake.download_name_len]);
+    // The click went to the button: the viewer stayed shut
+    try std.testing.expect(state.preview == null);
+    try std.testing.expect(t.hasText("Downloading…"));
+
+    // The chip
+    t.moveTo(5, 5);
+    for (0..3) |_| t.frame();
+    const chip = t.findText("report.pdf") orelse return error.TextNotFound;
+    t.moveTo(chip.x + 4, chip.y + 4);
+    for (0..3) |_| t.frame();
+    try std.testing.expect(findLast(&t, "arrow.down.to.line") != null);
+    try clickLast(&t, "arrow.down.to.line");
+    for (0..2) |_| t.frame();
+    try std.testing.expectEqual(@as(usize, 2), fake.download_calls);
+    try std.testing.expectEqualStrings("report.pdf", fake.download_name[0..fake.download_name_len]);
+    try std.testing.expectEqual(@as(usize, 0), last_link_len);
+
+    // The network side's answer is shown
+    try st.apply(.{ .toast = "Saved to ~/Downloads/report.pdf" });
+    state.announce();
+    for (0..2) |_| t.frame();
+    try std.testing.expect(t.hasText("Saved to ~/Downloads/report.pdf"));
+    try std.testing.expect(st.toast == null);
+}
+
+test "a file without a private URL has no download button" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    try seedStore(&st);
+    try st.apply(.{ .message = .{ .channel = "C1", .message = .{
+        .ts = "1700000300.000100",
+        .user = "U2",
+        .text = "a link",
+        .files = &.{.{ .id = "F9", .name = "sheet", .link = "https://docs.google.com/x" }},
+    } } });
+    var fake: Fake = .{};
+    var state = newFakeState(gpa, &st, &fake);
+    defer state.deinit();
+    state.preferred = "C1";
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..4) |_| t.frame();
+    const chip = t.findText("sheet") orelse return error.TextNotFound;
+    t.moveTo(chip.x + 4, chip.y + 4);
+    for (0..3) |_| t.frame();
+    try std.testing.expect(findLast(&t, "arrow.down.to.line") == null);
 }
 
 test "sidebar: search lists only matches, Esc and the clear button empty it" {

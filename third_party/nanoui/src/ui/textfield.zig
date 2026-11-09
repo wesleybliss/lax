@@ -415,8 +415,8 @@ pub fn textField(c: *Context, buffer: *TextBuffer, opts: Options) Result {
                 e.caret = lines_mod.vertical(c, buffer.text(), style, lines_mod.layout(c, buffer.text(), style, wrap_w), e.caret, if (k == .up) -1 else 1);
                 if (!c.input.shift) e.anchor = e.caret;
             } else apply(buffer, e, .{ .command = if (k == .up) .move_line_start else .move_line_end }, opts, c.clipboard, &result),
-            .home => apply(buffer, e, .{ .command = .move_line_start }, opts, c.clipboard, &result),
-            .end => apply(buffer, e, .{ .command = .move_line_end }, opts, c.clipboard, &result),
+            .home => apply(buffer, e, .{ .command = if (c.input.shift) .select_line_start else .move_line_start }, opts, c.clipboard, &result),
+            .end => apply(buffer, e, .{ .command = if (c.input.shift) .select_line_end else .move_line_end }, opts, c.clipboard, &result),
             .tab => c.focusCycle(c.input.shift),
             .enter => if (multi and (c.input.shift or c.input.alt)) {
                 apply(buffer, e, .{ .command = .insert_line_break }, opts, c.clipboard, &result);

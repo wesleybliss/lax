@@ -602,10 +602,15 @@ fn editShortcut(s: *Surface, key: u21) bool {
         'x' => .{ .command = .cut },
         'a' => .{ .command = .select_all },
         'v' => {
+            // Files copied in the file manager come with their names as text:
+            // the view gets them as files.
+            if (@import("desktop.zig").clipboard.hasFiles()) return false;
             const pasted = @import("desktop.zig").clipboard.readText(s.gpa) catch return true;
             // No text: the view may take Ctrl+V for something else (an image).
             const t = pasted orelse return false;
             defer s.gpa.free(t);
+            // A picture alone can read as empty text
+            if (t.len == 0) return false;
             for (t) |*ch| if (ch.* == '\n' or ch.* == '\r') {
                 ch.* = ' ';
             };

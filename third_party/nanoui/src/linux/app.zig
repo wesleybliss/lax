@@ -14,6 +14,11 @@ const Window = window_mod.Window;
 
 pub const Options = struct {
     name: []const u8 = "nanoui",
+    /// Linux: the reverse-DNS id the desktop file is named for
+    /// (`com.example.app.desktop`). Wayland sends it as the window's app id,
+    /// and the shell finds the app's name and icon by it; without one GTK uses
+    /// the executable's name, which matches no desktop file.
+    app_id: ?[*:0]const u8 = null,
     /// Quit when the last window closes.
     quit_on_last_window_closed: bool = true,
     // The macOS app's hooks, accepted here and not called yet.
@@ -84,6 +89,7 @@ pub const App = struct {
         if (self.gui or self.headless) return;
         if (for_page) @import("webkit.zig").prepare();
         if (!gtk.load()) return error.GtkMissing;
+        if (self.options.app_id) |id| gtk.api.g_set_prgname(id);
         if (!gtk.ready()) return error.NoDisplay;
         if (self.debug) std.debug.print("nanoui: GTK {d}\n", .{@as(u8, if (gtk.v4) 4 else 3)});
         self.gui = true;

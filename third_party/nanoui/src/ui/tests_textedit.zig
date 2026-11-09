@@ -114,6 +114,28 @@ test "shift-return inserts newline" {
     try testing.expectEqual(@as(u32, 0), s.sent);
 }
 
+test "shift-home and shift-end select to the start and the end" {
+    var s: Composer = .{};
+    defer s.buf.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(testing.allocator, .init(&s, Composer.view), .{});
+    defer t.deinit();
+    try t.clickText("Ask");
+    t.typeText("hello");
+    t.ctx.input.shift = true;
+    t.key(.home);
+    t.ctx.input.shift = false;
+    t.typeText("X");
+    try testing.expectEqualStrings("X", s.buf.text());
+    t.typeText("yz");
+    t.key(.home);
+    t.ctx.input.shift = true;
+    t.key(.end);
+    t.ctx.input.shift = false;
+    t.typeText("Q");
+    try testing.expectEqualStrings("Q", s.buf.text());
+}
+
 test "return submits" {
     var s: Composer = .{};
     defer s.buf.deinit();
