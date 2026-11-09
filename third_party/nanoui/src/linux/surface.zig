@@ -533,6 +533,14 @@ pub fn keyPress(s: *Surface, keyval: c_uint, state: c_uint, e: ?*gtk.Event) bool
     in.ctrl = ctrl;
     in.alt = alt;
     const key = keyOf(keyval);
+    // Ctrl with Backspace, Delete or an arrow works on words in a text field
+    if (ctrl and !alt and s.ctx.focused_text != null) if (key) |k| if (wordCommand(k, in.shift)) |cmd| {
+        var ops = [1]ctx_mod.TextOp{.{ .command = cmd }};
+        s.ctx.input.ops = &ops;
+        s.frame();
+        s.ctx.input.ops = &.{};
+        return true;
+    };
     // Key combinations go to the menus' accelerators, then the view.
     const special: ?u21 = if (key) |k| switch (k) {
         .up => ui.Shortcut.up,
@@ -574,6 +582,17 @@ pub fn keyPress(s: *Surface, keyval: c_uint, state: c_uint, e: ?*gtk.Event) bool
     in.chars = s.committed.items;
     s.frame();
     return true;
+}
+
+/// What Ctrl plus this key does in a text field
+fn wordCommand(key: ctx_mod.Key, shift: bool) ?ctx_mod.Command {
+    return switch (key) {
+        .backspace => .delete_word_backward,
+        .delete => .delete_word_forward,
+        .left => if (shift) .select_word_left else .move_word_left,
+        .right => if (shift) .select_word_right else .move_word_right,
+        else => null,
+    };
 }
 
 /// Ctrl+C, X, V and A in a text field: copy, cut, paste, select all.

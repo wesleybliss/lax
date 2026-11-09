@@ -194,7 +194,7 @@ pub const Menu = struct {
         if (m.picker_open) m.ensureUnique();
         const p = kit.popover(c, "emoji-picker", &m.picker_open, m.anchor, .{ .placement = .bottom_end, .width = picker_w, .padding = 8, .gap = 6 }) orelse return null;
         defer p.end();
-        _ = ui.textField(c, &m.query, .{ .placeholder = "Search emoji", .width = .fill, .size = 14 });
+        _ = ui.textField(c, &m.query, .{ .caret_color = theme.caretColor(c.theme.dark), .placeholder = "Search emoji", .width = .fill, .size = 14 });
         const hits = m.pickerHits(c.alloc(), std.mem.trim(u8, m.query.text(), " :"));
         var chosen: ?[]const u8 = null;
         var hovered: ?[]const u8 = null;
@@ -271,7 +271,7 @@ pub const Menu = struct {
         const p = kit.popover(c, "forward-to", &m.forward_open, m.anchor, .{ .placement = .bottom_end, .width = forward_w, .padding = 8, .gap = 6 }) orelse return null;
         defer p.end();
         ui.text(c, "Forward message to…", .{ .size = 13, .weight = .semibold, .color = c.theme.muted });
-        _ = ui.textField(c, &m.forward_query, .{ .placeholder = "Search conversations", .width = .fill, .size = 14 });
+        _ = ui.textField(c, &m.forward_query, .{ .caret_color = theme.caretColor(c.theme.dark), .placeholder = "Search conversations", .width = .fill, .size = 14 });
         const query = std.mem.trim(u8, m.forward_query.text(), " #");
         var dests: std.ArrayList(Dest) = .empty;
         for (st.channels.items) |*ch| {

@@ -38,6 +38,7 @@ const Pump = struct {
         }
         if (p.debug) std.debug.print("wake: applied {d} updates, {d} channels, {d} users, connection={s}\n", .{ items.items.len, p.st.channels.items.len, p.st.users.count(), @tagName(p.st.connection) });
         p.state.afterUpdates();
+        p.state.announce();
         if (p.window) |w| {
             if (!p.restarting) if (p.st.app_update) |u| if (u.phase == .restart) {
                 p.restarting = true;
@@ -141,6 +142,11 @@ fn actionApplyUpdate(ctx: *anyopaque) void {
     updater.apply();
 }
 
+fn actionCheckUpdate(ctx: *anyopaque) void {
+    const updater: *app.updater.Updater = @ptrCast(@alignCast(ctx));
+    updater.checkNow();
+}
+
 fn actionManual(ctx: *anyopaque, url: []const u8, token: []const u8, cookie: []const u8) void {
     const net: *Net = @ptrCast(@alignCast(ctx));
     net.manualCredentials(url, token, cookie);
@@ -191,6 +197,7 @@ fn run(init: std.process.Init, relaunch_path: *?[]const u8) !void {
         .load_feed = actionFeed,
         .update_ctx = &updater,
         .apply_update = actionApplyUpdate,
+        .check_update = actionCheckUpdate,
     });
     defer state.deinit();
     state.preferred = channel;

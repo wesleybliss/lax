@@ -206,6 +206,16 @@ fn fakeOpener(_: std.mem.Allocator, _: std.Io, url: []const u8) void {
     last_link_len = url.len;
 }
 
+var last_notice: [256]u8 = undefined;
+var last_notice_len: usize = 0;
+var notice_count: usize = 0;
+
+fn fakeNotifier(_: std.mem.Allocator, _: std.Io, title: []const u8, text: []const u8) void {
+    const line = std.fmt.bufPrint(&last_notice, "{s} | {s}", .{ title, text }) catch return;
+    last_notice_len = line.len;
+    notice_count += 1;
+}
+
 const Fake = struct {
     opened: ?[]const u8 = null,
     team: ?[]const u8 = null,
@@ -229,6 +239,7 @@ const Fake = struct {
     away: ?bool = null,
     feed_calls: usize = 0,
     update_calls: usize = 0,
+    check_calls: usize = 0,
     feed_kind: ?store.FeedKind = null,
     edited: [128]u8 = undefined,
     edited_len: usize = 0,
@@ -260,6 +271,7 @@ const Fake = struct {
             .set_presence = setPresence,
             .load_feed = loadFeed,
             .apply_update = applyUpdate,
+            .check_update = checkUpdate,
             .update_ctx = f,
         };
     }
@@ -267,6 +279,11 @@ const Fake = struct {
     fn applyUpdate(ctx: *anyopaque) void {
         const f: *Fake = @ptrCast(@alignCast(ctx));
         f.update_calls += 1;
+    }
+
+    fn checkUpdate(ctx: *anyopaque) void {
+        const f: *Fake = @ptrCast(@alignCast(ctx));
+        f.check_calls += 1;
     }
 
     fn loadFeed(ctx: *anyopaque, kind: store.FeedKind) void {
@@ -1529,6 +1546,18 @@ test "account menu: avatar opens it, Settings opens the page, fonts and sizes ap
     try std.testing.expect(t.hasText("Exit Lax"));
     try std.testing.expect(!t.hasText("Sign out"));
     try t.screenshot("/tmp/lax-user-menu.png");
+    // Check for updates: asks the updater, closes the menu, then reports the answer
+    try t.clickText("Check for updates");
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqual(@as(usize, 1), fake.check_calls);
+    try std.testing.expect(!state.user_menu_open);
+    try st.apply(.{ .update_check = .current });
+    state.announce();
+    try std.testing.expect(st.update_check == null);
+    for (0..3) |_| t.frame();
+    try std.testing.expect(t.hasText("Lax is up to date"));
+    t.click(38, 640 - 16 - 26);
+    for (0..4) |_| t.frame();
     // Away
     try t.clickText("Set yourself as away");
     for (0..3) |_| t.frame();
@@ -1992,4 +2021,31 @@ test "font picker: opens on the chosen font, and its scrollbar thumb drags" {
     const moved = t.findText(near).?;
     try std.testing.expect(moved.y - row.y > 300);
     try t.screenshot("/tmp/lax-font-dragged.png");
+}
+
+test "announce: notifies for other conversations, stays quiet for the one on screen" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    try st.apply(.{ .self = .{ .user_id = "U1", .team_name = "Acme" } });
+    try st.apply(.{ .users = &.{.{ .id = "U2", .name = "ada" }} });
+    try st.apply(.{ .channels = &.{
+        .{ .id = "C1", .name = "general", .kind = .channel },
+        .{ .id = "D1", .name = "", .kind = .im, .user_id = "U2" },
+    } });
+    var fake: Fake = .{};
+    var state = app_view.State.init(gpa, std.testing.io, &st, fake.actions());
+    defer state.deinit();
+    state.notifier = fakeNotifier;
+    notice_count = 0;
+    state.select("C1");
+
+    // Open in the focused window: no notification, and the queue is emptied
+    try st.apply(.{ .message = .{ .channel = "D1", .message = .{ .ts = "1700000001.000000", .user = "U2", .text = "<@U1> see *this*" } } });
+    try st.apply(.{ .message = .{ .channel = "C1", .message = .{ .ts = "1700000002.000000", .user = "U2", .text = "<@U1> in view" } } });
+    try std.testing.expectEqual(@as(usize, 2), st.notices.items.len);
+    state.announce();
+    try std.testing.expectEqual(@as(usize, 1), notice_count);
+    try std.testing.expectEqualStrings("ada | @U1 see this", last_notice[0..last_notice_len]);
+    try std.testing.expectEqual(@as(usize, 0), st.notices.items.len);
 }

@@ -3,6 +3,7 @@
 const std = @import("std");
 const nanoui = @import("nanoui");
 const ui = nanoui.ui;
+const theme = @import("theme.zig");
 const synthetic = @import("synthetic.zig");
 const var_list = @import("var_list.zig");
 
@@ -86,7 +87,7 @@ pub const State = struct {
         ui.divider(c);
         const bar = ui.div(c).row().wFull().px(12).py(10);
         defer bar.end();
-        const res = ui.textArea(c, &s.input, .{ .placeholder = "Message #general", .bare = false, .max_lines = 8 });
+        const res = ui.textArea(c, &s.input, .{ .caret_color = theme.caretColor(c.theme.dark), .placeholder = "Message #general", .bare = false, .max_lines = 8 });
         if (res.submitted) {
             s.send(s.input.text());
             s.input.clear();

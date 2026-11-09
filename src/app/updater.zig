@@ -59,6 +59,8 @@ pub const Updater = struct {
     quit: std.atomic.Value(bool) = .init(false),
     /// The UI asked to install what was announced
     apply_requested: std.atomic.Value(bool) = .init(false),
+    /// The UI asked to check now, instead of at the next 30 minute mark
+    check_requested: std.atomic.Value(bool) = .init(false),
     /// Downloading or installing (quitting then does not wait for the thread)
     installing: std.atomic.Value(bool) = .init(false),
     /// Set once an install worked: what to start in place of this process (gpa-owned)
@@ -92,6 +94,13 @@ pub const Updater = struct {
         u.apply_requested.store(true, .release);
     }
 
+    /// UI thread: check for a release now, and report how it went
+    pub fn checkNow(u: *Updater) void {
+        // No thread (not Linux, or `LAX_NO_UPDATE`): nothing will answer
+        if (u.thread == null) return u.emitCheck(.unsupported);
+        u.check_requested.store(true, .release);
+    }
+
     fn dbg(u: *const Updater, comptime fmt: []const u8, args: anytype) void {
         if (u.debug) std.debug.print("update: " ++ fmt ++ "\n", args);
     }
@@ -111,6 +120,16 @@ pub const Updater = struct {
         u.wake.signal();
     }
 
+    fn emitCheck(u: *Updater, result: store.UpdateCheck) void {
+        if (u.quit.load(.acquire)) return;
+        const item: store.Item = .{ .arena = .init(u.gpa), .update = .{ .update_check = result } };
+        u.updates.push(u.gpa, u.io, item) catch {
+            var it = item;
+            return it.deinit();
+        };
+        u.wake.signal();
+    }
+
     fn sleepTick(u: *Updater) bool {
         u.io.sleep(.fromMilliseconds(tick_ms), .awake) catch return false;
         return true;
@@ -119,28 +138,45 @@ pub const Updater = struct {
     fn run(u: *Updater) void {
         var arena_state = std.heap.ArenaAllocator.init(u.gpa);
         defer arena_state.deinit();
-        const how = detect(arena_state.allocator(), u) orelse return u.dbg("not installed from a package: updates are off", .{});
+        const how = detect(arena_state.allocator(), u) orelse {
+            u.dbg("not installed from a package: updates are off", .{});
+            // Still answers a manual check
+            while (!u.quit.load(.acquire)) {
+                if (u.check_requested.swap(false, .acq_rel)) u.emitCheck(.unsupported);
+                if (!u.sleepTick()) return;
+            }
+            return;
+        };
         u.dbg("installed as {s} ({s})", .{ @tagName(how.kind), how.path });
 
         // Each check's release lives in its own arena, replaced by the next
         var found_arena: ?std.heap.ArenaAllocator = null;
         defer if (found_arena) |*a| a.deinit();
         var found: ?Found = null;
+        var manual = false;
 
         while (!u.quit.load(.acquire)) {
+            const asked = manual;
+            manual = false;
             var next_arena = std.heap.ArenaAllocator.init(u.gpa);
             if (u.check(next_arena.allocator(), how.kind)) |release| {
                 if (found_arena) |*a| a.deinit();
                 found_arena = next_arena;
                 found = release;
                 u.emit(.available, release.version, "", .{});
+                if (asked) u.emitCheck(.found);
             } else |err| {
                 u.dbg("check: {s}", .{@errorName(err)});
                 next_arena.deinit();
+                if (asked) u.emitCheck(if (err == error.NoUpdate) .current else .failed);
             }
 
             var waited: u64 = 0;
             while (waited < check_ms and !u.quit.load(.acquire)) : (waited += tick_ms) {
+                if (u.check_requested.swap(false, .acq_rel)) {
+                    manual = true;
+                    break;
+                }
                 if (u.apply_requested.swap(false, .acq_rel)) if (found) |f| {
                     // Installed: the UI restarts the app, nothing left to check
                     if (u.install(how, f)) return;

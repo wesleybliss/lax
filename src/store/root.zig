@@ -113,6 +113,75 @@ pub const SidebarMode = enum {
     }
 };
 
+/// Slack's desktop notification level for a conversation
+pub const NotifyMode = enum {
+    everything,
+    /// @you, @channel and @here, keywords; always for a DM
+    mentions,
+    nothing,
+
+    /// Parses a pref value ("everything", "mentions_dms", "nothing"), `mentions` for an unknown one
+    pub fn parse(value: []const u8) NotifyMode {
+        if (std.mem.eql(u8, value, "everything")) return .everything;
+        if (std.mem.eql(u8, value, "nothing")) return .nothing;
+        return .mentions;
+    }
+};
+
+/// One conversation's own notification settings (they win over the global ones)
+pub const ChannelNotify = struct {
+    desktop: ?NotifyMode = null,
+    muted: bool = false,
+    /// Unix seconds a temporary mute ends (0: until unmuted)
+    muted_until: i64 = 0,
+    /// Ignore @channel and @here
+    quiet_broadcast: bool = false,
+};
+
+pub const ChannelNotifyInfo = struct {
+    id: []const u8,
+    settings: ChannelNotify,
+};
+
+/// The `all_notifications_prefs` Slack setting
+pub const NotifyInfo = struct {
+    /// Channels
+    desktop: NotifyMode = .mentions,
+    /// Group DMs
+    group: NotifyMode = .everything,
+    /// Comma separated words that always notify (unless `nothing`)
+    keywords: []const u8 = "",
+    /// Notifications say "New message" instead of the text
+    hide_text: bool = false,
+    channels: []const ChannelNotifyInfo = &.{},
+};
+
+const NotifyPrefs = struct {
+    desktop: NotifyMode = .mentions,
+    group: NotifyMode = .everything,
+    keywords: []u8 = &.{},
+    hide_text: bool = false,
+    channels: std.StringHashMapUnmanaged(ChannelNotify) = .empty,
+};
+
+/// A message that should raise a desktop notification
+pub const Notice = struct {
+    /// The workspace's name
+    team: []u8,
+    channel: []u8,
+    /// A channel's `#name`, a person's name
+    title: []u8,
+    /// The author's id (may be empty)
+    user: []u8,
+    /// Slack mrkdwn
+    text: []u8,
+    thread_ts: []u8,
+    hide_text: bool,
+};
+
+/// Notices waiting for the UI; the oldest are dropped past this
+pub const max_notices = 50;
+
 pub const ReactionInfo = struct {
     /// Emoji name, with a `::skin-tone-N` suffix if any
     name: []const u8,
@@ -179,6 +248,16 @@ pub const UpdatePhase = enum {
     restart,
 };
 
+/// How a check the user asked for ended
+pub const UpdateCheck = enum {
+    /// A newer release exists (see `app_update`)
+    found,
+    current,
+    failed,
+    /// This install does not update itself
+    unsupported,
+};
+
 pub const AppUpdate = struct {
     phase: UpdatePhase,
     version: []const u8,
@@ -214,6 +293,7 @@ pub const Update = union(enum) {
     marked: struct { channel: []const u8, ts: []const u8, unread: ?u32 = null, mentions: ?u32 = null },
     unreads: []const UnreadInfo,
     sidebar_mode: SidebarMode,
+    notify: NotifyInfo,
     /// A top-row page's contents, newest first
     feed: struct { kind: FeedKind, entries: []const FeedEntryInfo },
     /// The workspaces to switch between, and which one is shown
@@ -228,6 +308,7 @@ pub const Update = union(enum) {
     status: []const u8,
     /// The app itself: a newer release, and how installing it is going
     app_update: AppUpdate,
+    update_check: UpdateCheck,
 };
 
 /// An update with the memory its slices point into
@@ -339,9 +420,10 @@ const Space = struct {
     status: []u8,
     last_selected: []u8,
     sidebar_mode: SidebarMode,
+    notify: NotifyPrefs,
     feeds: [feed_kinds]Feed,
 
-    const empty: Space = .{ .self_id = &.{}, .team_name = &.{}, .users = .empty, .channels = .empty, .thread = null, .connection = .connecting, .status = &.{}, .last_selected = &.{}, .sidebar_mode = .active, .feeds = @splat(.{}) };
+    const empty: Space = .{ .self_id = &.{}, .team_name = &.{}, .users = .empty, .channels = .empty, .thread = null, .connection = .connecting, .status = &.{}, .last_selected = &.{}, .sidebar_mode = .active, .notify = .{}, .feeds = @splat(.{}) };
 };
 
 const feed_kinds = std.enums.values(FeedKind).len;
@@ -364,11 +446,16 @@ pub const Store = struct {
     /// The conversation open last in this workspace, to return to
     last_selected: []u8 = &.{},
     sidebar_mode: SidebarMode = .active,
+    notify: NotifyPrefs = .{},
+    /// Messages the UI should announce; it takes them after each batch of updates
+    notices: std.ArrayList(Notice) = .empty,
     feeds: [feed_kinds]Feed = @splat(.{}),
     /// Filled from the disk cache; the first workspace list confirms or replaces it
     from_cache: bool = false,
     /// A newer release of the app (not tied to a workspace); its strings are owned
     app_update: ?AppUpdate = null,
+    /// The answer to the user's "Check for updates", until the UI shows it
+    update_check: ?UpdateCheck = null,
     /// Other workspaces' data, by team id
     parked: std.StringHashMapUnmanaged(Space) = .empty,
     /// Files' preview pictures by file id (ids are unique across workspaces)
@@ -400,6 +487,8 @@ pub const Store = struct {
         }
         s.parked.deinit(s.gpa);
         s.clearImages();
+        s.clearNotices();
+        s.notices.deinit(s.gpa);
     }
 
     fn clearTeams(s: *Store) void {
@@ -415,7 +504,7 @@ pub const Store = struct {
     // The shown workspace's data moves in and out of `Space`s
 
     fn takeSpace(s: *Store) Space {
-        const sp: Space = .{ .self_id = s.self_id, .team_name = s.team_name, .users = s.users, .channels = s.channels, .thread = s.thread, .connection = s.connection, .status = s.status, .last_selected = s.last_selected, .sidebar_mode = s.sidebar_mode, .feeds = s.feeds };
+        const sp: Space = .{ .self_id = s.self_id, .team_name = s.team_name, .users = s.users, .channels = s.channels, .thread = s.thread, .connection = s.connection, .status = s.status, .last_selected = s.last_selected, .sidebar_mode = s.sidebar_mode, .notify = s.notify, .feeds = s.feeds };
         s.putSpace(.empty);
         return sp;
     }
@@ -430,6 +519,7 @@ pub const Store = struct {
         s.status = sp.status;
         s.last_selected = sp.last_selected;
         s.sidebar_mode = sp.sidebar_mode;
+        s.notify = sp.notify;
         s.feeds = sp.feeds;
     }
 
@@ -457,6 +547,7 @@ pub const Store = struct {
         if (sp.thread) |*t| s.freeThread(t);
         for (&sp.feeds) |*f| s.clearFeed(f);
         for (&sp.feeds) |*f| f.entries.deinit(s.gpa);
+        s.freeNotify(&sp.notify);
     }
 
     fn clearFeed(s: *Store, f: *Feed) void {
@@ -522,7 +613,7 @@ pub const Store = struct {
     /// Applies an update the network side tagged with its workspace
     pub fn applyItem(s: *Store, item: *const Item) std.mem.Allocator.Error!void {
         switch (item.update) {
-            .teams, .need_manual, .manual_done, .app_update => return s.apply(item.update),
+            .teams, .need_manual, .manual_done, .app_update, .update_check => return s.apply(item.update),
             else => {},
         }
         const tag = item.team();
@@ -727,6 +818,9 @@ pub const Store = struct {
                 if (s.thread) |*t| if (std.mem.eql(u8, t.channel, m.channel) and std.mem.eql(u8, t.ts, m.thread_ts)) {
                     try s.insertInto(&t.messages, m.message, null);
                 };
+                // A broadcast reply is announced as the channel message it also is
+                const broadcast = if (m.message.subtype) |sub| std.mem.eql(u8, sub, "thread_broadcast") else false;
+                if (!broadcast) if (s.channel(m.channel)) |c| try s.notice(c, m.message);
             },
             .reply_count => |r| {
                 const c = s.channel(r.channel) orelse return;
@@ -819,6 +913,7 @@ pub const Store = struct {
                 }
             },
             .sidebar_mode => |m| s.sidebar_mode = m,
+            .notify => |n| try s.setNotify(n),
             .feed => |f| try s.setFeed(f.kind, f.entries),
             .teams => |t| {
                 var fresh: std.ArrayList(Team) = .empty;
@@ -875,6 +970,7 @@ pub const Store = struct {
             },
             .connection => |v| s.connection = v,
             .status => |msg| try s.replace(&s.status, msg),
+            .update_check => |r| s.update_check = r,
             .app_update => |info| {
                 const version = try s.gpa.dupe(u8, info.version);
                 errdefer s.gpa.free(version);
@@ -987,6 +1083,102 @@ pub const Store = struct {
         c.prepended += added;
     }
 
+    fn freeNotify(s: *Store, n: *NotifyPrefs) void {
+        s.gpa.free(n.keywords);
+        var it = n.channels.keyIterator();
+        while (it.next()) |k| s.gpa.free(k.*);
+        n.channels.deinit(s.gpa);
+    }
+
+    fn setNotify(s: *Store, info: NotifyInfo) std.mem.Allocator.Error!void {
+        var fresh: NotifyPrefs = .{ .desktop = info.desktop, .group = info.group, .hide_text = info.hide_text };
+        errdefer s.freeNotify(&fresh);
+        fresh.keywords = try s.gpa.dupe(u8, info.keywords);
+        for (info.channels) |c| {
+            const id = try s.gpa.dupe(u8, c.id);
+            errdefer s.gpa.free(id);
+            try fresh.channels.put(s.gpa, id, c.settings);
+        }
+        s.freeNotify(&s.notify);
+        s.notify = fresh;
+    }
+
+    /// Whether Slack's notification settings call for a desktop notification
+    /// for a message someone else just sent. Thread follows are not known,
+    /// so a reply in a channel notifies only like any other message there.
+    pub fn wantsNotice(s: *const Store, c: *const Channel, info: MessageInfo) bool {
+        if (info.user) |u| if (std.mem.eql(u8, u, s.self_id)) return false;
+        // System messages (joins, pins, topic changes) never notify
+        if (info.subtype) |sub| {
+            for ([_][]const u8{ "bot_message", "file_share", "thread_broadcast", "me_message" }) |ok| {
+                if (std.mem.eql(u8, sub, ok)) break;
+            } else return false;
+        }
+        if (s.isSelfDm(c)) return false;
+        const own = s.notify.channels.get(c.id) orelse ChannelNotify{};
+        if (own.muted) {
+            // The message's own timestamp is the clock for a temporary mute
+            const now = std.fmt.parseInt(i64, info.ts[0 .. std.mem.indexOfScalar(u8, info.ts, '.') orelse info.ts.len], 10) catch 0;
+            if (own.muted_until == 0 or now < own.muted_until) return false;
+        }
+        const mode = own.desktop orelse if (c.kind == .mpim) s.notify.group else s.notify.desktop;
+        switch (mode) {
+            .nothing => return false,
+            .everything => return true,
+            .mentions => {},
+        }
+        // 1:1 DMs are covered by "mentions and DMs"
+        if (c.kind == .im) return true;
+        if (s.directlyMentioned(info.text)) return true;
+        if (!own.quiet_broadcast and s.broadcastsToMe(info.text)) return true;
+        return hasKeyword(s.notify.keywords, info.text);
+    }
+
+    fn broadcastsToMe(_: *const Store, text: []const u8) bool {
+        return std.mem.indexOf(u8, text, "<!here") != null or std.mem.indexOf(u8, text, "<!channel") != null or std.mem.indexOf(u8, text, "<!everyone") != null;
+    }
+
+    fn directlyMentioned(s: *const Store, text: []const u8) bool {
+        if (s.self_id.len == 0) return false;
+        var buf: [32]u8 = undefined;
+        const needle = std.fmt.bufPrint(&buf, "<@{s}", .{s.self_id}) catch return false;
+        return std.mem.indexOf(u8, text, needle) != null;
+    }
+
+    /// Queues a notification when the settings want one
+    fn notice(s: *Store, c: *const Channel, info: MessageInfo) std.mem.Allocator.Error!void {
+        if (!s.wantsNotice(c, info)) return;
+        const team = try s.gpa.dupe(u8, s.team_name);
+        errdefer s.gpa.free(team);
+        const channel_id = try s.gpa.dupe(u8, c.id);
+        errdefer s.gpa.free(channel_id);
+        const title = if (c.kind == .channel or c.kind == .private)
+            try std.fmt.allocPrint(s.gpa, "#{s}", .{c.name})
+        else
+            try s.gpa.dupe(u8, s.channelName(c));
+        errdefer s.gpa.free(title);
+        const user = try s.gpa.dupe(u8, info.user orelse "");
+        errdefer s.gpa.free(user);
+        const text = try s.gpa.dupe(u8, info.text);
+        errdefer s.gpa.free(text);
+        const thread_ts = try s.gpa.dupe(u8, if (info.thread_ts) |t| t else "");
+        errdefer s.gpa.free(thread_ts);
+        if (s.notices.items.len >= max_notices) {
+            var old = s.notices.orderedRemove(0);
+            s.freeNotice(&old);
+        }
+        try s.notices.append(s.gpa, .{ .team = team, .channel = channel_id, .title = title, .user = user, .text = text, .thread_ts = thread_ts, .hide_text = s.notify.hide_text });
+    }
+
+    fn freeNotice(s: *Store, n: *Notice) void {
+        inline for (.{ n.team, n.channel, n.title, n.user, n.text, n.thread_ts }) |str| s.gpa.free(str);
+    }
+
+    pub fn clearNotices(s: *Store) void {
+        for (s.notices.items) |*n| s.freeNotice(n);
+        s.notices.clearRetainingCapacity();
+    }
+
     fn mentionsMe(s: *const Store, text: []const u8) bool {
         if (std.mem.indexOf(u8, text, "<!here") != null or std.mem.indexOf(u8, text, "<!channel") != null or std.mem.indexOf(u8, text, "<!everyone") != null) return true;
         if (s.self_id.len == 0) return false;
@@ -1084,6 +1276,7 @@ pub const Store = struct {
             if (live and !mine) {
                 c.unread = true;
                 if (c.kind == .im or c.kind == .mpim or s.mentionsMe(info.text)) c.mentions += 1;
+                try s.notice(c, info);
             }
         }
         // Bound memory: drop the oldest
@@ -1094,6 +1287,16 @@ pub const Store = struct {
         }
     }
 };
+
+/// Whether `text` holds one of the comma separated `keywords`, ignoring case
+fn hasKeyword(keywords: []const u8, text: []const u8) bool {
+    var it = std.mem.tokenizeScalar(u8, keywords, ',');
+    while (it.next()) |raw| {
+        const word = std.mem.trim(u8, raw, " ");
+        if (word.len > 0 and std.ascii.findIgnoreCase(text, word) != null) return true;
+    }
+    return false;
+}
 
 /// Slack timestamps are fixed-width decimal strings, so compare by length
 /// first, then bytes
@@ -1165,6 +1368,77 @@ test "a bot author is named by its messages" {
     try s.apply(.{ .channels = &.{.{ .id = "C1", .name = "sales", .kind = .channel }} });
     try s.apply(.{ .message = .{ .channel = "C1", .message = .{ .ts = "1700000001.000000", .user = "B1", .bot_name = "Sales Alerts", .text = "New Sales Alert!" } } });
     try std.testing.expectEqualStrings("Sales Alerts", s.userName("B1").?);
+}
+
+test "notices follow Slack's notification settings" {
+    const gpa = std.testing.allocator;
+    var s = Store.init(gpa);
+    defer s.deinit();
+    try s.apply(.{ .self = .{ .user_id = "U1", .team_name = "Acme" } });
+    try s.apply(.{ .users = &.{.{ .id = "U2", .name = "grace" }} });
+    try s.apply(.{ .channels = &.{
+        .{ .id = "C1", .name = "general", .kind = .channel },
+        .{ .id = "C2", .name = "loud", .kind = .channel },
+        .{ .id = "C3", .name = "muted", .kind = .channel },
+        .{ .id = "C4", .name = "later", .kind = .channel },
+        .{ .id = "D1", .name = "", .kind = .im, .user_id = "U2" },
+    } });
+    try s.apply(.{ .notify = .{ .keywords = "deploy, Outage", .channels = &.{
+        .{ .id = "C2", .settings = .{ .desktop = .everything } },
+        .{ .id = "C3", .settings = .{ .muted = true, .desktop = .everything } },
+        .{ .id = "C4", .settings = .{ .muted = true, .muted_until = 1700000500 } },
+    } } });
+    const say = struct {
+        fn at(st: *Store, ch: []const u8, ts: []const u8, user: []const u8, text: []const u8) !void {
+            try st.apply(.{ .message = .{ .channel = ch, .message = .{ .ts = ts, .user = user, .text = text } } });
+        }
+    }.at;
+
+    // Mentions only (the global default): plain channel talk is silent
+    try say(&s, "C1", "1700000001.000000", "U2", "lunch?");
+    try std.testing.expectEqual(@as(usize, 0), s.notices.items.len);
+    try say(&s, "C1", "1700000002.000000", "U2", "hey <@U1> look");
+    try say(&s, "C1", "1700000003.000000", "U2", "<!here> standup");
+    try say(&s, "C1", "1700000004.000000", "U2", "Deploy is done");
+    try say(&s, "C1", "1700000005.000000", "U1", "<@U1> my own message");
+    try std.testing.expectEqual(@as(usize, 3), s.notices.items.len);
+    try std.testing.expectEqualStrings("#general", s.notices.items[0].title);
+    try std.testing.expectEqualStrings("Acme", s.notices.items[0].team);
+    s.clearNotices();
+
+    // A DM always notifies, with the person's name
+    try say(&s, "D1", "1700000006.000000", "U2", "ping");
+    try std.testing.expectEqual(@as(usize, 1), s.notices.items.len);
+    try std.testing.expectEqualStrings("grace", s.notices.items[0].title);
+    s.clearNotices();
+
+    // Per-channel "everything" notifies; muted never does, until a temporary mute ends
+    try say(&s, "C2", "1700000007.000000", "U2", "anything");
+    try say(&s, "C3", "1700000008.000000", "U2", "<@U1> anything");
+    try say(&s, "C4", "1700000009.000000", "U2", "<@U1> still muted");
+    try say(&s, "C4", "1700000600.000000", "U2", "<@U1> mute is over");
+    try std.testing.expectEqual(@as(usize, 2), s.notices.items.len);
+    s.clearNotices();
+
+    // @channel can be silenced per conversation; "nothing" silences even a mention
+    try s.apply(.{ .notify = .{ .desktop = .nothing, .channels = &.{.{ .id = "C1", .settings = .{ .quiet_broadcast = true } }} } });
+    try say(&s, "C1", "1700000010.000000", "U2", "<!channel> hi");
+    try say(&s, "C2", "1700000011.000000", "U2", "hi");
+    try std.testing.expectEqual(@as(usize, 0), s.notices.items.len);
+
+    // Old history never notifies; system messages and our own DM neither
+    try s.apply(.{ .notify = .{} });
+    try s.apply(.{ .history = .{ .channel = "D1", .messages = &.{.{ .ts = "1600000000.000000", .user = "U2", .text = "old" }} } });
+    try s.apply(.{ .message = .{ .channel = "D1", .message = .{ .ts = "1700000012.000000", .user = "U2", .subtype = "channel_join", .text = "joined" } } });
+    try std.testing.expectEqual(@as(usize, 0), s.notices.items.len);
+}
+
+test "notify modes parse" {
+    try std.testing.expectEqual(NotifyMode.everything, NotifyMode.parse("everything"));
+    try std.testing.expectEqual(NotifyMode.mentions, NotifyMode.parse("mentions_dms"));
+    try std.testing.expectEqual(NotifyMode.nothing, NotifyMode.parse("nothing"));
+    try std.testing.expect(hasKeyword("a, Deploy ,", "the DEPLOY ran"));
+    try std.testing.expect(!hasKeyword(" , ", "anything"));
 }
 
 test "unreads, mentions, teams and reset" {

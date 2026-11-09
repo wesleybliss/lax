@@ -7,6 +7,7 @@ pub const theme = @import("theme.zig");
 pub const composer = @import("composer.zig");
 pub const attachments = @import("attachments.zig");
 pub const open_url = @import("open_url.zig");
+pub const notify = @import("notify.zig");
 pub const layout = @import("layout.zig");
 pub const settings = @import("settings.zig");
 pub const message_menu = @import("message_menu.zig");
@@ -14,6 +15,7 @@ pub const recents = @import("recents.zig");
 
 test {
     _ = open_url;
+    _ = notify;
     _ = layout;
     _ = settings;
     _ = message_menu;

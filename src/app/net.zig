@@ -716,6 +716,20 @@ pub const Net = struct {
         const mode = store.SidebarMode.parse(json.str(prefs, "sidebar_behavior") orelse "");
         n.dbg("sidebar mode: {s}", .{@tagName(mode)});
         n.emit(.{ .arena = std.heap.ArenaAllocator.init(n.gpa), .update = .{ .sidebar_mode = mode } });
+        n.emitNotify(prefs);
+    }
+
+    /// The notification settings inside the same prefs answer. Best effort:
+    /// without them only DMs and mentions notify (Slack's own default).
+    fn emitNotify(n: *Net, prefs: std.json.ObjectMap) void {
+        const raw = json.str(prefs, "all_notifications_prefs") orelse return;
+        var item_arena = std.heap.ArenaAllocator.init(n.gpa);
+        const info = notifyInfo(item_arena.allocator(), raw, json.str(prefs, "muted_channels") orelse "") catch {
+            item_arena.deinit();
+            return;
+        };
+        n.dbg("notifications: {d} conversations with their own settings", .{info.channels.len});
+        n.emit(.{ .arena = item_arena, .update = .{ .notify = info } });
     }
 
     /// Initial read state, the way the web client gets it. Best effort: it
@@ -1503,6 +1517,44 @@ pub const Net = struct {
     }
 };
 
+/// Slack's `all_notifications_prefs` (a JSON string) and the older
+/// `muted_channels` (comma separated ids) as one set of settings
+fn notifyInfo(arena: std.mem.Allocator, raw: []const u8, muted_ids: []const u8) !store.NotifyInfo {
+    const root = std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{}) catch return error.BadPrefs;
+    if (root != .object) return error.BadPrefs;
+    var info: store.NotifyInfo = .{};
+    if (json.obj(root.object, "global")) |g| {
+        if (json.str(g, "global_desktop")) |v| info.desktop = store.NotifyMode.parse(v);
+        if (json.str(g, "global_mpdm_desktop")) |v| info.group = store.NotifyMode.parse(v);
+        info.keywords = json.str(g, "global_keywords") orelse "";
+        info.hide_text = json.flag(g, "no_text_in_notifications");
+    }
+    var list: std.ArrayList(store.ChannelNotifyInfo) = .empty;
+    if (json.obj(root.object, "channels")) |chs| {
+        var it = chs.iterator();
+        while (it.next()) |kv| {
+            if (kv.value_ptr.* != .object) continue;
+            const c = kv.value_ptr.object;
+            try list.append(arena, .{ .id = kv.key_ptr.*, .settings = .{
+                .desktop = if (json.str(c, "desktop")) |v| store.NotifyMode.parse(v) else null,
+                .muted = json.flag(c, "muted"),
+                .muted_until = json.int(c, "temp_mute_expiration_ts") orelse 0,
+                .quiet_broadcast = json.flag(c, "suppress_at_channel"),
+            } });
+        }
+    }
+    // Ids only in the old list are muted for good
+    var ids = std.mem.tokenizeScalar(u8, muted_ids, ',');
+    outer: while (ids.next()) |id| {
+        for (list.items) |*c| if (std.mem.eql(u8, c.id, id)) {
+            continue :outer;
+        };
+        try list.append(arena, .{ .id = id, .settings = .{ .muted = true } });
+    }
+    info.channels = list.items;
+    return info;
+}
+
 /// A user object to the name we show: display name, else real name, else handle
 /// The text of Block Kit rich text, in mrkdwn the renderer understands
 fn richText(arena: std.mem.Allocator, out: *std.ArrayList(u8), nodes: []const std.json.Value) std.mem.Allocator.Error!void {
@@ -1580,6 +1632,37 @@ fn normalizeUrl(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Err
     const host = t[0..host_end];
     if (host.len == 0) return gpa.dupe(u8, "");
     return std.fmt.allocPrint(gpa, "https://{s}", .{host});
+}
+
+test "notifyInfo reads Slack's notification settings" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const raw =
+        \\{"global":{"global_desktop":"mentions_dms","global_mpdm_desktop":"everything","global_keywords":"deploy","no_text_in_notifications":true},
+        \\ "channels":{"C1":{"desktop":"everything","suppress_at_channel":true},"D1":{"muted":true,"temp_mute_expiration_ts":0},"C2":{"muted":true,"temp_mute_expiration_ts":"1700000500"}}}
+    ;
+    const info = try notifyInfo(arena_state.allocator(), raw, "C3,C1");
+    try std.testing.expectEqual(store.NotifyMode.mentions, info.desktop);
+    try std.testing.expectEqual(store.NotifyMode.everything, info.group);
+    try std.testing.expectEqualStrings("deploy", info.keywords);
+    try std.testing.expect(info.hide_text);
+    try std.testing.expectEqual(@as(usize, 4), info.channels.len);
+    var seen: usize = 0;
+    for (info.channels) |c| {
+        if (std.mem.eql(u8, c.id, "C1")) {
+            seen += 1;
+            try std.testing.expectEqual(@as(?store.NotifyMode, .everything), c.settings.desktop);
+            try std.testing.expect(c.settings.quiet_broadcast and !c.settings.muted);
+        } else if (std.mem.eql(u8, c.id, "C2")) {
+            seen += 1;
+            try std.testing.expectEqual(@as(i64, 1700000500), c.settings.muted_until);
+        } else if (std.mem.eql(u8, c.id, "C3")) {
+            seen += 1;
+            try std.testing.expect(c.settings.muted and c.settings.muted_until == 0);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 3), seen);
+    try std.testing.expectError(error.BadPrefs, notifyInfo(arena_state.allocator(), "not json", ""));
 }
 
 test "richText flattens rich text blocks" {

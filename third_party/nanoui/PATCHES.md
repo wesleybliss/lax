@@ -74,3 +74,9 @@ family per window theme, fixed at window creation.
 **Why:** `scroll.tryPressScrollbar` ignored a press on a scroll box's track whenever the node under the pointer was interactive, to let a control flush against the box's edge take its own click. A popover's panel is interactive and holds its list, so the list's thumb never dragged (Lax's font picker).
 
 **What:** `scroll.zig`: the press is only left to the node under the pointer when that node is not an ancestor of the scroll box (`isInside`): a control in the box, or an unrelated overlay, still wins; a panel that contains the box does not.
+
+## 4. Ctrl+Backspace, Ctrl+Delete and Ctrl+Left/Right work on words (Linux)
+
+**Why:** `surface.zig` sent these as plain `.backspace`, `.delete` and arrow keys, so Ctrl was dropped and a field only moved or deleted one character.
+
+**What:** `keyPress` turns them into the existing word commands (`delete_word_backward`, `delete_word_forward`, `move_word_left`/`right`, and the `select_` pair with Shift) while a text field has focus.

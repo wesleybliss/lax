@@ -145,6 +145,11 @@ const dark_theme: ui.Theme = .{
 };
 
 /// The base colors of a mode, with no theme
+/// The text cursor's color: the built-in text color, whatever the theme sets
+pub fn caretColor(dark: bool) ui.Color {
+    return if (dark) dark_theme.text else light_theme.text;
+}
+
 pub fn base(dark: bool) Resolved {
     return if (dark) .{ .theme = dark_theme, .pal = dark_pal } else .{ .theme = light_theme, .pal = light_pal };
 }

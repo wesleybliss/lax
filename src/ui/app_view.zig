@@ -9,6 +9,7 @@ const ui = nanoui.ui;
 const var_list = @import("var_list.zig");
 const theme = @import("theme.zig");
 const open_url = @import("open_url.zig");
+const notify = @import("notify.zig");
 const composer_mod = @import("composer.zig");
 const attachments = @import("attachments.zig");
 const layout_mod = @import("layout.zig");
@@ -88,6 +89,8 @@ pub const Actions = struct {
     load_feed: *const fn (ctx: *anyopaque, kind: store.FeedKind) void,
     /// Download and install the announced app update (`store.app_update`)
     apply_update: *const fn (ctx: *anyopaque) void,
+    /// Look for a newer release now; the answer is `store.update_check`
+    check_update: *const fn (ctx: *anyopaque) void,
     update_ctx: *anyopaque,
 };
 
@@ -284,6 +287,7 @@ pub const State = struct {
     edit_composer: composer_mod.Composer,
     /// Opens a link; replaced in tests
     opener: *const fn (gpa: std.mem.Allocator, io: std.Io, url: []const u8) void = open_url.open,
+    notifier: notify.Sender = notify.send,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, st: *store.Store, actions: Actions) State {
         return .{ .gpa = gpa, .io = io, .store = st, .actions = actions, .list = .{ .gpa = gpa }, .main_composer = .init(gpa), .thread_composer = .init(gpa), .main_attach = .init(gpa), .thread_attach = .init(gpa), .settings_arena = .init(gpa), .themes_arena = .init(gpa), .menu = .init(gpa), .toaster = .{ .gpa = gpa }, .edit_composer = .init(gpa) };
@@ -353,6 +357,49 @@ pub const State = struct {
         s.gpa.free(s.marked_ts);
         s.marked_ts = dup;
         s.actions.mark(s.actions.ctx, id, c.latest);
+    }
+
+    /// Call after `afterUpdates`: shows the store's queued notifications,
+    /// except for what the user is looking at right now
+    pub fn announce(s: *State) void {
+        s.announceUpdateCheck();
+        defer s.store.clearNotices();
+        if (s.store.notices.items.len == 0) return;
+        const focused = if (s.window) |w| w.isFocused() else true;
+        var arena_state = std.heap.ArenaAllocator.init(s.gpa);
+        defer arena_state.deinit();
+        const a = arena_state.allocator();
+        const several = s.store.teams.items.len > 1;
+        for (s.store.notices.items) |n| {
+            if (focused and s.isViewing(n)) continue;
+            const text = notify.body(a, s.store, n, s.resolver()) catch continue;
+            const title = if (several) std.fmt.allocPrint(a, "{s} · {s}", .{ n.title, n.team }) catch n.title else n.title;
+            s.notifier(s.gpa, s.io, title, text);
+        }
+    }
+
+    /// Says how the user's "Check for updates" went
+    fn announceUpdateCheck(s: *State) void {
+        const result = s.store.update_check orelse return;
+        s.store.update_check = null;
+        // The toast keeps its own copy
+        var buf: [96]u8 = undefined;
+        const text = switch (result) {
+            .found => if (s.store.app_update) |u| std.fmt.bufPrint(&buf, "Lax v{s} is available: click the arrow above your avatar", .{u.version}) catch "An update is available" else "An update is available",
+            .current => "Lax is up to date",
+            .failed => "Could not check for updates",
+            .unsupported => "This install of Lax does not update itself",
+        };
+        s.toast(text);
+    }
+
+    /// The message is in the conversation (or thread) on screen
+    fn isViewing(s: *const State, n: store.Notice) bool {
+        const id = s.selected orelse return false;
+        if (!std.mem.eql(u8, id, n.channel) or !std.mem.eql(u8, s.store.team_name, n.team)) return false;
+        if (n.thread_ts.len == 0) return true;
+        const t = s.store.thread orelse return false;
+        return std.mem.eql(u8, t.channel, n.channel) and std.mem.eql(u8, t.ts, n.thread_ts);
     }
 
     // Message list source
@@ -664,6 +711,11 @@ pub const State = struct {
             s.openTeamPage(c, "account/settings", "");
             s.user_menu_open = false;
         }
+        if (s.menuRow(c, "Check for updates", "")) {
+            s.actions.check_update(s.actions.update_ctx);
+            s.toast("Checking for updates…");
+            s.user_menu_open = false;
+        }
         ui.divider(c);
         if (s.menuRow(c, "Exit Lax", "")) {
             if (s.window) |w| w.close();
@@ -704,11 +756,11 @@ pub const State = struct {
 
         const wide: ui.Length = .{ .px = 504 };
         ui.text(c, "Workspace address", .{ .size = 13, .weight = .semibold });
-        _ = ui.textField(c, &s.manual_url, .{ .placeholder = "https://yourteam.slack.com", .width = wide, .size = 15 });
+        _ = ui.textField(c, &s.manual_url, .{ .caret_color = theme.caretColor(c.theme.dark), .placeholder = "https://yourteam.slack.com", .width = wide, .size = 15 });
         ui.text(c, "Token (xoxc-…)", .{ .size = 13, .weight = .semibold });
-        _ = ui.textField(c, &s.manual_token, .{ .placeholder = "xoxc-…", .width = wide, .size = 15, .password = true });
+        _ = ui.textField(c, &s.manual_token, .{ .caret_color = theme.caretColor(c.theme.dark), .placeholder = "xoxc-…", .width = wide, .size = 15, .password = true });
         ui.text(c, "Cookie d (xoxd-…)", .{ .size = 13, .weight = .semibold });
-        const res = ui.textField(c, &s.manual_cookie, .{ .placeholder = "xoxd-…", .width = wide, .size = 15, .password = true });
+        const res = ui.textField(c, &s.manual_cookie, .{ .caret_color = theme.caretColor(c.theme.dark), .placeholder = "xoxd-…", .width = wide, .size = 15, .password = true });
 
         const ready = s.manual_url.text().len > 0 and s.manual_token.text().len > 0 and s.manual_cookie.text().len > 0;
         const go = ui.button(c, if (s.manual_busy) "Checking…" else "Connect", .{ .variant = .primary, .disabled = !ready or s.manual_busy, .size = 15 });
@@ -1241,7 +1293,7 @@ pub const State = struct {
         const box = ui.div(c).row().wFull().h(36).px(10).gap(8).itemsCenter().rounded(radius).bg(s.pal.container_high).border(c.theme.border).borderW(1);
         defer box.end();
         ui.icon(c, "magnifyingglass", .{ .size = 15, .frame = 18, .color = c.theme.muted });
-        const res = ui.textField(c, &s.filter, .{ .placeholder = "Find a conversation…", .width = .fill, .size = 14, .bare = true });
+        const res = ui.textField(c, &s.filter, .{ .caret_color = theme.caretColor(c.theme.dark), .placeholder = "Find a conversation…", .width = .fill, .size = 14, .bare = true });
         if (res.focused and c.shortcut(.{ .key = ui.Shortcut.escape })) s.filter.clear();
         if (s.filter.text().len == 0) return;
         const x = ui.div(c).w(22).h(22).center().rounded(6).control().hover(c.theme.surface_hover);

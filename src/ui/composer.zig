@@ -331,6 +331,7 @@ pub const Composer = struct {
         const box_it = box.interaction();
         if (box_it.hovered) c.cursor = .text;
         const res = ui.textArea(c, &k.buf, .{
+            .caret_color = theme.caretColor(c.theme.dark),
             .placeholder = opts.placeholder,
             .bare = false,
             .min_lines = opts.min_lines,

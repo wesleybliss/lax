@@ -13,6 +13,16 @@ pub fn botName(o: std.json.ObjectMap) ?[]const u8 {
     return null;
 }
 
+/// An integer field, whether Slack sent a number or a numeric string
+pub fn int(o: std.json.ObjectMap, k: []const u8) ?i64 {
+    const v = o.get(k) orelse return null;
+    return switch (v) {
+        .integer => |n| n,
+        .string => |t| std.fmt.parseInt(i64, t, 10) catch null,
+        else => null,
+    };
+}
+
 pub fn flag(o: std.json.ObjectMap, k: []const u8) bool {
     const v = o.get(k) orelse return false;
     return v == .bool and v.bool;
