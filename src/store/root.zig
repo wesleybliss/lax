@@ -137,6 +137,8 @@ pub const FileInfo = struct {
 pub const MessageInfo = struct {
     ts: []const u8,
     user: ?[]const u8,
+    /// What a bot author calls itself: names `user` when that is a `bot_id`
+    bot_name: ?[]const u8 = null,
     /// Slack mrkdwn, entities still escaped
     text: []const u8,
     thread_ts: ?[]const u8 = null,
@@ -993,6 +995,14 @@ pub const Store = struct {
         return std.mem.indexOf(u8, text, needle) != null;
     }
 
+    /// A bot with no user record (a webhook, say) is only a `bot_id`: name it from its messages
+    fn nameBot(s: *Store, info: MessageInfo) std.mem.Allocator.Error!void {
+        const id = info.user orelse return;
+        const name = info.bot_name orelse return;
+        if (s.users.get(id)) |u| if (std.mem.eql(u8, u.name, name)) return;
+        try s.upsertUser(.{ .id = id, .name = name, .is_bot = true });
+    }
+
     fn upsertUser(s: *Store, user: User) std.mem.Allocator.Error!void {
         if (s.users.getPtr(user.id)) |existing| {
             try s.replace(&existing.name, user.name);
@@ -1045,6 +1055,7 @@ pub const Store = struct {
     }
 
     fn insertMessage(s: *Store, c: *Channel, info: MessageInfo, live: bool) std.mem.Allocator.Error!void {
+        try s.nameBot(info);
         const items = c.messages.items;
         // Binary search for the slot; an existing ts is an echo or a refetch
         var lo: usize = 0;
@@ -1145,6 +1156,15 @@ test "DM name comes from the user" {
     try s.apply(.{ .channels = &.{.{ .id = "D1", .name = "", .kind = .im, .user_id = "U9" }} });
     try s.apply(.{ .users = &.{.{ .id = "U9", .name = "grace" }} });
     try std.testing.expectEqualStrings("grace", s.channelName(s.channel("D1").?));
+}
+
+test "a bot author is named by its messages" {
+    const gpa = std.testing.allocator;
+    var s = Store.init(gpa);
+    defer s.deinit();
+    try s.apply(.{ .channels = &.{.{ .id = "C1", .name = "sales", .kind = .channel }} });
+    try s.apply(.{ .message = .{ .channel = "C1", .message = .{ .ts = "1700000001.000000", .user = "B1", .bot_name = "Sales Alerts", .text = "New Sales Alert!" } } });
+    try std.testing.expectEqualStrings("Sales Alerts", s.userName("B1").?);
 }
 
 test "unreads, mentions, teams and reset" {

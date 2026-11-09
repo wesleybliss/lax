@@ -11,13 +11,16 @@
 //! reaction_added, reaction_removed. Seen and ignored: thread_subscribed,
 //! thread_marked, update_global_thread_state, activity.
 const std = @import("std");
+const jsonutil = @import("jsonutil.zig");
 
 pub const Error = error{BadFrame} || std.mem.Allocator.Error;
 
 pub const Message = struct {
     channel: []const u8,
-    /// Absent for bot and system messages
+    /// The author; for a bot with no user of its own, its `bot_id`. Absent for system messages
     user: ?[]const u8,
+    /// What a bot message calls itself, to name a `bot_id` author
+    bot_name: ?[]const u8 = null,
     ts: []const u8,
     thread_ts: ?[]const u8,
     subtype: ?[]const u8,
@@ -139,7 +142,8 @@ pub fn parse(arena: std.mem.Allocator, frame: []const u8) Error!Event {
     }
     if (eql(u8, kind, "message")) return .{ .message = .{
         .channel = str(o, "channel") orelse return error.BadFrame,
-        .user = str(o, "user"),
+        .user = str(o, "user") orelse str(o, "bot_id"),
+        .bot_name = jsonutil.botName(o),
         .ts = str(o, "ts") orelse return error.BadFrame,
         .thread_ts = str(o, "thread_ts"),
         .subtype = str(o, "subtype"),

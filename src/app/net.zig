@@ -1465,7 +1465,7 @@ pub const Net = struct {
             n.emit(.{ .arena = item_arena, .update = .{ .thread_message = .{
                 .channel = m.channel,
                 .thread_ts = m.thread_ts.?,
-                .message = .{ .ts = m.ts, .user = m.user, .text = m.text, .thread_ts = m.thread_ts, .subtype = m.subtype, .files = fileInfos(item_arena.allocator(), m.files) catch &.{} },
+                .message = .{ .ts = m.ts, .user = m.user, .bot_name = m.bot_name, .text = m.text, .thread_ts = m.thread_ts, .subtype = m.subtype, .files = fileInfos(item_arena.allocator(), m.files) catch &.{} },
             } } });
             return;
         }
@@ -1481,6 +1481,7 @@ pub const Net = struct {
                 break :blk .{ .message = .{ .channel = m.channel, .message = .{
                     .ts = m.ts,
                     .user = m.user,
+                    .bot_name = m.bot_name,
                     .text = m.text,
                     .thread_ts = m.thread_ts,
                     .subtype = m.subtype,
@@ -1649,6 +1650,7 @@ fn messageInfo(arena: std.mem.Allocator, o: std.json.ObjectMap, self_id: []const
     return .{
         .ts = try arena.dupe(u8, json.str(o, "ts") orelse ""),
         .user = if (json.str(o, "user") orelse json.str(o, "bot_id")) |u| try arena.dupe(u8, u) else null,
+        .bot_name = if (json.botName(o)) |b| try arena.dupe(u8, b) else null,
         .text = try arena.dupe(u8, json.str(o, "text") orelse ""),
         .thread_ts = if (json.str(o, "thread_ts")) |t| try arena.dupe(u8, t) else null,
         .subtype = if (json.str(o, "subtype")) |t| try arena.dupe(u8, t) else null,

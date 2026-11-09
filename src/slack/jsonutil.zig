@@ -6,6 +6,13 @@ pub fn str(o: std.json.ObjectMap, k: []const u8) ?[]const u8 {
     return if (v == .string) v.string else null;
 }
 
+/// Who a bot message says it is: a custom `username`, else the app's own name
+pub fn botName(o: std.json.ObjectMap) ?[]const u8 {
+    if (str(o, "username")) |u| if (u.len > 0) return u;
+    if (obj(o, "bot_profile")) |p| if (str(p, "name")) |n| if (n.len > 0) return n;
+    return null;
+}
+
 pub fn flag(o: std.json.ObjectMap, k: []const u8) bool {
     const v = o.get(k) orelse return false;
     return v == .bool and v.bool;
