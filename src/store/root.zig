@@ -41,6 +41,21 @@ pub const SectionPlace = enum {
     below,
 };
 
+/// What a sidebar row's context menu can do to its conversation
+pub const ChannelOp = enum {
+    star,
+    unstar,
+    /// Hide a DM (it comes back with a new message)
+    close,
+    leave,
+    notify_all,
+    notify_mentions,
+    mute,
+    unmute,
+    /// A new section holding it, named by the argument
+    new_section,
+};
+
 /// The pages behind the sidebar's top rows that list messages
 pub const FeedKind = enum { threads, drafts, saved };
 
@@ -296,6 +311,8 @@ pub const Update = union(enum) {
     /// Read up to `ts` on another client (or this one); counts when Slack says
     marked: struct { channel: []const u8, ts: []const u8, unread: ?u32 = null, mentions: ?u32 = null },
     unreads: []const UnreadInfo,
+    /// We left a channel or closed a DM
+    left: []const u8,
     sidebar_mode: SidebarMode,
     notify: NotifyInfo,
     /// A top-row page's contents, newest first
@@ -921,6 +938,7 @@ pub const Store = struct {
                     if (info.latest.len > 0) try s.replace(&c.activity, info.latest);
                 }
             },
+            .left => |id| s.leave(id),
             .sidebar_mode => |m| s.sidebar_mode = m,
             .notify => |n| try s.setNotify(n),
             .feed => |f| try s.setFeed(f.kind, f.entries),
@@ -1095,6 +1113,33 @@ pub const Store = struct {
             if (c.messages.items.len > before) added += 1;
         }
         c.prepended += added;
+    }
+
+    /// A DM we closed stays known (a new message lists it again); a channel we left is gone
+    fn leave(s: *Store, id: []const u8) void {
+        const c = s.channel(id) orelse return;
+        if (c.kind == .im or c.kind == .mpim) {
+            c.listed = false;
+            c.unread = false;
+            c.mentions = 0;
+            return;
+        }
+        if (s.thread) |t| if (std.mem.eql(u8, t.channel, id)) s.closeThread();
+        const at = (@intFromPtr(c) - @intFromPtr(s.channels.items.ptr)) / @sizeOf(Channel);
+        var gone = s.channels.orderedRemove(at);
+        s.freeChannel(&gone);
+    }
+
+    /// Whether a conversation is muted (for good, or until a time that has not come)
+    pub fn isMuted(s: *const Store, c: *const Channel, now_secs: i64) bool {
+        const own = s.notify.channels.get(c.id) orelse return false;
+        return own.muted and (own.muted_until == 0 or now_secs < own.muted_until);
+    }
+
+    /// The desktop notification level a conversation has: its own, else the global one for its kind
+    pub fn notifyMode(s: *const Store, c: *const Channel) NotifyMode {
+        const own = s.notify.channels.get(c.id) orelse ChannelNotify{};
+        return own.desktop orelse if (c.kind == .mpim) s.notify.group else s.notify.desktop;
     }
 
     fn freeNotify(s: *Store, n: *NotifyPrefs) void {

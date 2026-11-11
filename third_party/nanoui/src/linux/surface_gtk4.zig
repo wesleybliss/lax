@@ -33,6 +33,11 @@ pub fn attachArea(s: *Surface) void {
     gtk.connect(click, "pressed", @ptrCast(&onPressed), s);
     gtk.connect(click, "released", @ptrCast(&onReleased), s);
     g4.gtk_widget_add_controller(area, click);
+    // The right button asks for a context menu (`Div.secondaryClicked`).
+    const right = g4.gtk_gesture_click_new();
+    g4.gtk_gesture_single_set_button(right, 3);
+    gtk.connect(right, "pressed", @ptrCast(&onSecondaryPressed), s);
+    g4.gtk_widget_add_controller(area, right);
     const motion = g4.gtk_event_controller_motion_new();
     gtk.connect(motion, "motion", @ptrCast(&onMotion), s);
     gtk.connect(motion, "leave", @ptrCast(&onLeave), s);
@@ -158,6 +163,15 @@ fn onPressed(gesture: *anyopaque, n_press: c_int, x: f64, y: f64, data: ?*anyopa
     s.ctx.input.click_count = @intCast(@max(1, n_press));
     s.ctx.updateHot();
     s.ctx.pointerDown();
+    s.frame();
+}
+
+fn onSecondaryPressed(gesture: *anyopaque, _: c_int, x: f64, y: f64, data: ?*anyopaque) callconv(.c) void {
+    const s = of(data);
+    gtk.api.gtk_widget_grab_focus(s.area);
+    at(s, gesture, x, y);
+    s.ctx.updateHot();
+    s.ctx.secondaryDown();
     s.frame();
 }
 

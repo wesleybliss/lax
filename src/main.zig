@@ -112,6 +112,11 @@ fn actionDelete(ctx: *anyopaque, channel: []const u8, ts: []const u8) void {
     net.delete(channel, ts);
 }
 
+fn actionChannelOp(ctx: *anyopaque, channel: []const u8, op: store.ChannelOp, arg: []const u8) void {
+    const net: *Net = @ptrCast(@alignCast(ctx));
+    net.channelOp(channel, op, arg);
+}
+
 fn actionSave(ctx: *anyopaque, channel: []const u8, ts: []const u8) void {
     const net: *Net = @ptrCast(@alignCast(ctx));
     net.save(channel, ts);
@@ -195,6 +200,7 @@ fn run(init: std.process.Init, relaunch_path: *?[]const u8) !void {
         .edit = actionEdit,
         .delete = actionDelete,
         .save = actionSave,
+        .channel_op = actionChannelOp,
         .typing = actionTyping,
         .mark = actionMark,
         .switch_team = actionSwitchTeam,

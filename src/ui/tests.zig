@@ -251,6 +251,12 @@ const Fake = struct {
     deleted_ts: [32]u8 = undefined,
     deleted_len: usize = 0,
     saved_calls: usize = 0,
+    op_calls: usize = 0,
+    op: ?store.ChannelOp = null,
+    op_channel: [32]u8 = undefined,
+    op_channel_len: usize = 0,
+    op_arg: [64]u8 = undefined,
+    op_arg_len: usize = 0,
     marked: [32]u8 = undefined,
     marked_len: usize = 0,
     send_channel: [16]u8 = undefined,
@@ -270,6 +276,7 @@ const Fake = struct {
             .edit = edit,
             .delete = delete,
             .save = save,
+            .channel_op = channelOp,
             .typing = typing,
             .mark = mark,
             .switch_team = switchTeam,
@@ -370,6 +377,15 @@ const Fake = struct {
         const f: *Fake = @ptrCast(@alignCast(ctx));
         @memcpy(f.deleted_ts[0..ts.len], ts);
         f.deleted_len = ts.len;
+    }
+    fn channelOp(ctx: *anyopaque, channel: []const u8, op: store.ChannelOp, arg: []const u8) void {
+        const f: *Fake = @ptrCast(@alignCast(ctx));
+        f.op_calls += 1;
+        f.op = op;
+        f.op_channel_len = channel.len;
+        @memcpy(f.op_channel[0..channel.len], channel);
+        f.op_arg_len = arg.len;
+        @memcpy(f.op_arg[0..arg.len], arg);
     }
     fn save(ctx: *anyopaque, _: []const u8, _: []const u8) void {
         const f: *Fake = @ptrCast(@alignCast(ctx));
@@ -1320,6 +1336,91 @@ test "drafts page: drafts, scheduled and sent entries open their conversation" {
     for (0..3) |_| t.frame();
     try std.testing.expect(!t.hasText("Sent"));
     try std.testing.expectEqualStrings("C1", state.selected.?);
+}
+
+test "sidebar right-click: a channel's menu stars it, a DM's can be closed" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..3) |_| t.frame();
+
+    const dev = t.findText("dev").?;
+    t.secondaryClick(dev.x + dev.w / 2, dev.y + dev.h / 2);
+    for (0..3) |_| t.frame();
+    for ([_][]const u8{ "Copy name", "Copy link", "Star channel", "Move to new section", "All new posts", "Just mentions", "Mute channel", "Leave channel" }) |label| {
+        try std.testing.expect(t.hasText(label));
+    }
+    try std.testing.expect(!t.hasText("Close conversation"));
+    try t.clickText("Star channel");
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqual(store.ChannelOp.star, fake.op.?);
+    try std.testing.expectEqualStrings("C2", fake.op_channel[0..fake.op_channel_len]);
+    try std.testing.expectEqual(store.SectionPlace.starred, st.channel("C2").?.place);
+    // Starred now: the menu offers the way back
+    for (0..3) |_| t.frame();
+    const again = t.findText("dev").?;
+    t.secondaryClick(again.x + again.w / 2, again.y + again.h / 2);
+    for (0..3) |_| t.frame();
+    try std.testing.expect(t.hasText("Unstar channel"));
+    try t.clickText("Just mentions");
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqual(store.ChannelOp.notify_mentions, fake.op.?);
+
+    // A DM: no notification or leave entries, closing instead
+    const grace = t.findText("Grace").?;
+    t.secondaryClick(grace.x + grace.w / 2, grace.y + grace.h / 2);
+    for (0..3) |_| t.frame();
+    try std.testing.expect(t.hasText("Star conversation"));
+    try std.testing.expect(t.hasText("Close conversation"));
+    try std.testing.expect(!t.hasText("Leave channel"));
+    try std.testing.expect(!t.hasText("Just mentions"));
+    try t.clickText("Close conversation");
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqual(store.ChannelOp.close, fake.op.?);
+    try std.testing.expectEqualStrings("D1", fake.op_channel[0..fake.op_channel_len]);
+}
+
+test "sidebar right-click: leaving asks first, a new section takes a name" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..3) |_| t.frame();
+
+    const dev = t.findText("dev").?;
+    t.secondaryClick(dev.x + dev.w / 2, dev.y + dev.h / 2);
+    for (0..3) |_| t.frame();
+    try t.clickText("Leave channel");
+    for (0..6) |_| t.frame();
+    try std.testing.expect(t.hasText("Leave #dev?"));
+    try std.testing.expectEqual(@as(usize, 0), fake.op_calls);
+    try t.clickText("Cancel");
+    for (0..6) |_| t.frame();
+    try std.testing.expectEqual(@as(usize, 0), fake.op_calls);
+
+    const more = t.findText("dev").?;
+    t.secondaryClick(more.x + more.w / 2, more.y + more.h / 2);
+    for (0..3) |_| t.frame();
+    try t.clickText("Move to new section");
+    for (0..6) |_| t.frame();
+    try std.testing.expect(t.hasText("Name the section this conversation goes in."));
+    t.typeText("Work");
+    for (0..2) |_| t.frame();
+    try t.clickText("Create");
+    for (0..4) |_| t.frame();
+    try std.testing.expectEqual(store.ChannelOp.new_section, fake.op.?);
+    try std.testing.expectEqualStrings("Work", fake.op_arg[0..fake.op_arg_len]);
 }
 
 test "saved page: lists saved messages, empty state, opens the conversation" {

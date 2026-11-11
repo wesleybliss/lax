@@ -21,8 +21,13 @@ pub const Recents = struct {
 
     /// `name` becomes the newest; an older copy of it goes. Skin tones are dropped.
     pub fn push(r: *Recents, name: []const u8) void {
-        const base = if (std.mem.indexOf(u8, name, "::")) |i| name[0..i] else name;
-        if (base.len == 0 or base.len > name_max) return;
+        const stripped = if (std.mem.indexOf(u8, name, "::")) |i| name[0..i] else name;
+        if (stripped.len == 0 or stripped.len > name_max) return;
+        // `name` may point into `r.names` (the toolbar shows slices of it), and
+        // the shuffle below overwrites that storage, so work from a copy
+        var copy: [name_max]u8 = undefined;
+        @memcpy(copy[0..stripped.len], stripped);
+        const base = copy[0..stripped.len];
         var at: usize = r.n;
         for (0..r.n) |i| if (std.mem.eql(u8, r.get(i), base)) {
             at = i;
@@ -119,6 +124,21 @@ test "newest first, repeats move up, the list is bounded, defaults top it up" {
     try std.testing.expectEqual(@as(usize, max), r.n);
     try std.testing.expectEqualStrings("a9", r.get(0));
     try std.testing.expectEqualStrings("a2", r.get(max - 1));
+}
+
+test "pushing a slice of its own storage is safe" {
+    var r: Recents = .{};
+    r.push("a");
+    r.push("b");
+    r.push("c");
+    // Re-react with the toolbar's own slices: top, middle, bottom
+    r.push(r.get(0));
+    try std.testing.expectEqualStrings("c", r.get(0));
+    r.push(r.get(2));
+    try std.testing.expectEqualStrings("a", r.get(0));
+    try std.testing.expectEqualStrings("c", r.get(1));
+    try std.testing.expectEqualStrings("b", r.get(2));
+    try std.testing.expectEqual(@as(usize, 3), r.n);
 }
 
 test "recents round trip" {

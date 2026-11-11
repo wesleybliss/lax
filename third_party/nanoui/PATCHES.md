@@ -107,3 +107,9 @@ family per window theme, fixed at window creation.
 **Why:** `tryPressScrollbar` let any interactive node under the pointer take the press, so in a list whose rows reach the right edge (Lax's messages) the thumb could not be grabbed. Wheel scrolling was unaffected.
 
 **What:** `ui/scroll.zig`: a press on the thumb always starts the drag; a press on the bare track still gives way to a control flush against the edge.
+
+## The right button reaches the view (Linux, GTK 4)
+
+**Why:** `surface_gtk4.zig` only had a gesture for button 1, so a right-click never arrived and `Div.secondaryClicked` never fired (GTK 3's `onPress` already handled button 3).
+
+**What:** `linux/surface_gtk4.zig`: a second click gesture for button 3 that sets the pointer, updates the hot box and calls `secondaryDown`, as the GTK 3 path does.

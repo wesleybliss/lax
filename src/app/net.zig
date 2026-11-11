@@ -31,6 +31,8 @@ pub const Command = union(enum) {
     delete: struct { channel: []u8, ts: []u8 },
     /// Add a message to Saved
     save: struct { channel: []u8, ts: []u8 },
+    /// A sidebar context menu entry on one conversation (`arg`: a new section's name)
+    channel_op: struct { channel: []u8, op: store.ChannelOp, arg: []u8 },
     /// The user is typing in a conversation
     typing: []u8,
     /// The user opened a conversation: load its history if needed, mark read
@@ -94,6 +96,10 @@ pub const Command = union(enum) {
             .save => |m| {
                 gpa.free(m.channel);
                 gpa.free(m.ts);
+            },
+            .channel_op => |m| {
+                gpa.free(m.channel);
+                gpa.free(m.arg);
             },
             .typing => |ch| gpa.free(ch),
             .open => |ch| gpa.free(ch),
@@ -312,6 +318,12 @@ pub const Net = struct {
         const ch = n.gpa.dupe(u8, channel) catch return;
         const t = n.gpa.dupe(u8, ts) catch return;
         n.commands.push(n.gpa, n.io, .{ .save = .{ .channel = ch, .ts = t } }) catch {};
+    }
+
+    pub fn channelOp(n: *Net, channel: []const u8, op: store.ChannelOp, arg: []const u8) void {
+        const ch = n.gpa.dupe(u8, channel) catch return;
+        const a = n.gpa.dupe(u8, arg) catch return n.gpa.free(ch);
+        n.commands.push(n.gpa, n.io, .{ .channel_op = .{ .channel = ch, .op = op, .arg = a } }) catch {};
     }
 
     pub fn typing(n: *Net, channel: []const u8) void {
@@ -1353,6 +1365,68 @@ pub const Net = struct {
         };
     }
 
+    /// `callMessage` that says whether Slack accepted the call
+    fn callOk(n: *Net, api: *slack.http.Api, method: []const u8, what: []const u8, params: []const slack.http.Param) SessionError!bool {
+        var tmp = std.heap.ArenaAllocator.init(n.gpa);
+        defer tmp.deinit();
+        _ = api.call(tmp.allocator(), method, params) catch |err| {
+            if (err == error.SlackError) {
+                if (api.diag.isAuthError()) return error.AuthFailed;
+                n.emitStatus("{s} failed: {s}", .{ what, api.diag.slackError() });
+            } else n.emitStatus("{s} failed: {s}", .{ what, @errorName(err) });
+            return false;
+        };
+        return true;
+    }
+
+    /// One entry of a sidebar row's context menu
+    fn runChannelOp(n: *Net, api: *slack.http.Api, channel: []const u8, op: store.ChannelOp, arg: []const u8) SessionError!void {
+        switch (op) {
+            .star, .unstar => {
+                const method = if (op == .star) "stars.add" else "stars.remove";
+                _ = try n.callOk(api, method, "Star", &.{.{ "channel", channel }});
+                // Where it sits now (an unstarred one goes back to its own section)
+                try n.fetchConversations(api);
+            },
+            .new_section => {
+                if (arg.len == 0) return;
+                if (try n.callOk(api, "users.channelSections.create", "New section", &.{ .{ "name", arg }, .{ "channels", channel } })) {
+                    try n.fetchConversations(api);
+                }
+            },
+            .close => {
+                if (try n.callOk(api, "conversations.close", "Close", &.{.{ "channel", channel }})) {
+                    n.emit(.{ .arena = std.heap.ArenaAllocator.init(n.gpa), .update = .{ .left = try n.gpa.dupe(u8, channel) } });
+                }
+            },
+            .leave => {
+                if (try n.callOk(api, "conversations.leave", "Leave", &.{.{ "channel", channel }})) {
+                    n.emit(.{ .arena = std.heap.ArenaAllocator.init(n.gpa), .update = .{ .left = try n.gpa.dupe(u8, channel) } });
+                }
+            },
+            .notify_all, .notify_mentions, .mute, .unmute => try n.setChannelNotify(api, channel, op),
+        }
+    }
+
+    /// Changes one conversation's entry of `all_notifications_prefs`: the
+    /// whole setting is read, edited and written back, then read again so the
+    /// store shows what Slack holds
+    fn setChannelNotify(n: *Net, api: *slack.http.Api, channel: []const u8, op: store.ChannelOp) SessionError!void {
+        var tmp = std.heap.ArenaAllocator.init(n.gpa);
+        defer tmp.deinit();
+        const a = tmp.allocator();
+        const res = api.call(a, "users.prefs.get", &.{}) catch |err| return n.apiFailed(api, "users.prefs.get", err);
+        const prefs = json.obj(res.object, "prefs") orelse return;
+        const raw = json.str(prefs, "all_notifications_prefs") orelse "{}";
+        const edited = editNotifyPrefs(a, raw, channel, op) catch {
+            n.emitStatus("Notification settings failed: unreadable settings", .{});
+            return;
+        };
+        if (!try n.callOk(api, "users.prefs.set", "Notification settings", &.{ .{ "name", "all_notifications_prefs" }, .{ "value", edited } })) return;
+        const again = api.call(a, "users.prefs.get", &.{}) catch |err| return n.apiFailed(api, "users.prefs.get", err);
+        if (json.obj(again.object, "prefs")) |p| n.emitNotify(p);
+    }
+
     /// presence_sub for the people in our DMs, then ask for their current
     /// state (the socket is opened with no_query_on_subscribe)
     fn subscribePresence(n: *Net, sock: *slack.realtime.Socket) void {
@@ -1418,6 +1492,7 @@ pub const Net = struct {
                     .react => |m| try n.callReact(api, m.channel, m.ts, m.name, m.add),
                     .edit => |m| try n.callMessage(api, "chat.update", "Edit", &.{ .{ "channel", m.channel }, .{ "ts", m.ts }, .{ "text", m.text } }),
                     .delete => |m| try n.callMessage(api, "chat.delete", "Delete", &.{ .{ "channel", m.channel }, .{ "ts", m.ts } }),
+                    .channel_op => |m| try n.runChannelOp(api, m.channel, m.op, m.arg),
                     .save => |m| try n.callMessage(api, "saved.add", "Save", &.{ .{ "item_type", "message" }, .{ "item_id", m.channel }, .{ "ts", m.ts } }),
                     .typing => |ch| n.sendTyping(sock, ch),
                     .manual => {},
@@ -1583,6 +1658,38 @@ pub const Net = struct {
     }
 };
 
+/// `raw` (an `all_notifications_prefs` string) with one conversation's entry
+/// changed by `op`, as a string again. Everything else is kept as it was.
+fn editNotifyPrefs(arena: std.mem.Allocator, raw: []const u8, channel: []const u8, op: store.ChannelOp) ![]const u8 {
+    var root = std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{}) catch return error.BadPrefs;
+    if (root != .object) return error.BadPrefs;
+    const chs = try objectIn(arena, &root.object, "channels");
+    const own = try objectIn(arena, chs, channel);
+    switch (op) {
+        .notify_all => try own.put(arena, "desktop", .{ .string = "everything" }),
+        .notify_mentions => try own.put(arena, "desktop", .{ .string = "mentions" }),
+        .mute => {
+            try own.put(arena, "muted", .{ .bool = true });
+            try own.put(arena, "temp_mute_expiration_ts", .{ .integer = 0 });
+        },
+        .unmute => {
+            try own.put(arena, "muted", .{ .bool = false });
+            try own.put(arena, "temp_mute_expiration_ts", .{ .integer = 0 });
+        },
+        else => {},
+    }
+    var aw: std.Io.Writer.Allocating = .init(arena);
+    try std.json.Stringify.value(root, .{}, &aw.writer);
+    return aw.written();
+}
+
+/// The object under `key` of `map`, made when it is missing
+fn objectIn(arena: std.mem.Allocator, map: *std.json.ObjectMap, key: []const u8) !*std.json.ObjectMap {
+    const gop = try map.getOrPut(arena, key);
+    if (!gop.found_existing or gop.value_ptr.* != .object) gop.value_ptr.* = .{ .object = .empty };
+    return &gop.value_ptr.object;
+}
+
 /// Slack's `all_notifications_prefs` (a JSON string) and the older
 /// `muted_channels` (comma separated ids) as one set of settings
 fn notifyInfo(arena: std.mem.Allocator, raw: []const u8, muted_ids: []const u8) !store.NotifyInfo {
@@ -1729,6 +1836,30 @@ test "notifyInfo reads Slack's notification settings" {
     }
     try std.testing.expectEqual(@as(usize, 3), seen);
     try std.testing.expectError(error.BadPrefs, notifyInfo(arena_state.allocator(), "not json", ""));
+}
+
+test "editNotifyPrefs changes one conversation and keeps the rest" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const raw =
+        \\{"global":{"global_desktop":"mentions_dms"},"channels":{"C1":{"desktop":"everything","muted":false},"C2":{"muted":true}}}
+    ;
+    const mentions = try editNotifyPrefs(a, raw, "C1", .notify_mentions);
+    const info = try notifyInfo(a, mentions, "");
+    try std.testing.expectEqual(store.NotifyMode.mentions, info.desktop);
+    for (info.channels) |c| {
+        if (std.mem.eql(u8, c.id, "C1")) try std.testing.expectEqual(store.NotifyMode.mentions, c.settings.desktop.?);
+        if (std.mem.eql(u8, c.id, "C2")) try std.testing.expect(c.settings.muted);
+    }
+    // A conversation with no entry gets one; no `channels` at all is fine too
+    const muted = try editNotifyPrefs(a, "{}", "C9", .mute);
+    const fresh = try notifyInfo(a, muted, "");
+    try std.testing.expectEqual(@as(usize, 1), fresh.channels.len);
+    try std.testing.expectEqualStrings("C9", fresh.channels[0].id);
+    try std.testing.expect(fresh.channels[0].settings.muted);
+    const back = try notifyInfo(a, try editNotifyPrefs(a, muted, "C9", .unmute), "");
+    try std.testing.expect(!back.channels[0].settings.muted);
 }
 
 test "richText flattens rich text blocks" {

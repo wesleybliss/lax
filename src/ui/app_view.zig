@@ -15,6 +15,7 @@ const attachments = @import("attachments.zig");
 const layout_mod = @import("layout.zig");
 const settings_mod = @import("settings.zig");
 const message_menu = @import("message_menu.zig");
+const channel_menu = @import("channel_menu.zig");
 const recents_mod = @import("recents.zig");
 
 const mrkdwn = slack.mrkdwn;
@@ -38,6 +39,9 @@ const composer_tall_lines: u8 = 10;
 const rail_w: f32 = 76;
 const font_row_h: f32 = 32;
 const font_list_h: f32 = 320;
+/// The bar over the sidebar, the conversation and the thread, and its title's size
+const header_h: f32 = 52;
+const header_size: f32 = 15;
 /// Corner radius of rows, buttons and chips (pills and circles are too round)
 const radius: f32 = 8;
 /// Width the sidebar's icon column takes: `#`, an emoji, or a small avatar
@@ -112,6 +116,8 @@ pub const Actions = struct {
     download: *const fn (ctx: *anyopaque, name: []const u8, url: []const u8) void,
     /// Load (or refresh) one of the top-row pages
     load_feed: *const fn (ctx: *anyopaque, kind: store.FeedKind) void,
+    /// A sidebar context menu entry on a conversation (the argument: a new section's name)
+    channel_op: *const fn (ctx: *anyopaque, channel: []const u8, op: store.ChannelOp, arg: []const u8) void,
     /// Download and install the announced app update (`store.app_update`)
     apply_update: *const fn (ctx: *anyopaque) void,
     /// Look for a newer release now; the answer is `store.update_check`
@@ -305,6 +311,8 @@ pub const State = struct {
     last_typing_ms: i64 = 0,
     /// The toolbar's emoji picker, overflow menu, forward list and delete prompt
     menu: message_menu.Menu,
+    /// What a right-click on a sidebar row opens
+    channel_menu: channel_menu.Menu = .{},
     /// The emoji reacted with last
     recents: recents_mod.Recents = .{},
     /// Brief confirmations ("Link copied")
@@ -337,6 +345,7 @@ pub const State = struct {
         s.thread_composer.deinit();
         s.edit_composer.deinit();
         s.menu.deinit();
+        s.channel_menu.deinit();
         s.toaster.deinit();
         s.settings_arena.deinit();
         s.themes_arena.deinit();
@@ -568,6 +577,7 @@ pub const State = struct {
             s.threadPanel(c);
         }
         s.messageOverlays(c);
+        s.channelOverlays(c);
         s.previewOverlay(c);
         s.toaster.view(c);
 
@@ -615,6 +625,7 @@ pub const State = struct {
         s.filter.clear();
         s.cancelEdit();
         s.menu.closeAll();
+        s.channel_menu.closeAll();
         s.dropImages();
         // The command-line channel only makes sense for the first workspace
         s.preferred = null;
@@ -677,7 +688,7 @@ pub const State = struct {
         defer tile.end();
         const it = tile.interaction();
         if (it.clicked) s.user_menu_open = !s.user_menu_open;
-        s.avatar(c, name, s.store.self_id, 40, 18);
+        s.avatarShaped(c, name, s.store.self_id, 40, 18, 20);
         if (it.rect) |r| {
             // The presence dot on the avatar's corner
             const dot = ui.div(c).fixed().offset(r.x + r.w - 17, r.y + r.h - 17).layer(3).w(12).h(12).roundedFull().circular().bg(if (s.self_away) s.pal.container_high else c.theme.success).border(s.pal.container_high).borderW(2);
@@ -690,7 +701,11 @@ pub const State = struct {
     /// A user's picture on a rounded square (like Slack's), or their initial on a
     /// tonal tile until it arrives (or when they have none)
     fn avatar(s: *State, c: *ui.Context, name: []const u8, id: []const u8, size: f32, text_size: f32) void {
-        const corner = @round(size * 0.2);
+        s.avatarShaped(c, name, id, size, text_size, @round(size * 0.2));
+    }
+
+    /// `avatar` with its own corner radius (half the size: a circle)
+    fn avatarShaped(s: *State, c: *ui.Context, name: []const u8, id: []const u8, size: f32, text_size: f32, corner: f32) void {
         if (id.len > 0) {
             if (s.store.userAvatar(id)) |bytes| {
                 if (ui.image(c, .{ .key = c.print("{s}{s}", .{ store.avatar_prefix, id }), .bytes = bytes, .max_width = size, .max_height = size, .radius = corner, .scale = 1 })) return;
@@ -947,9 +962,9 @@ pub const State = struct {
         const page = ui.div(c).column().grow().hFull().bg(c.theme.background);
         defer page.end();
         {
-            const head = ui.div(c).row().itemsCenter().wFull().h(64).px(24);
+            const head = ui.div(c).row().itemsCenter().wFull().h(header_h).px(24);
             defer head.end();
-            ui.text(c, "Settings", .{ .size = 18, .weight = .bold });
+            ui.text(c, "Settings", .{ .size = header_size, .weight = .bold });
             ui.spacer(c);
             const close = ui.div(c).w(32).h(32).center().rounded(radius).control().hover(c.theme.surface_hover);
             defer close.end();
@@ -1250,9 +1265,9 @@ pub const State = struct {
         const col = ui.div(c).column().w(s.sidebar_px).hFull().bg(s.pal.container);
         defer col.end();
         {
-            const head = ui.div(c).row().itemsCenter().wFull().h(64).px(24);
+            const head = ui.div(c).row().itemsCenter().wFull().h(header_h).px(24);
             defer head.end();
-            ui.text(c, s.activeTeamName(), .{ .weight = .bold, .size = 18 });
+            ui.text(c, s.activeTeamName(), .{ .weight = .bold, .size = header_size });
         }
         s.filterBox(c);
         const scroller = ui.div(c).column().wFull().grow().scrollY().px(12).pb(12);
@@ -1395,9 +1410,9 @@ pub const State = struct {
         const col = ui.div(c).column().grow().hFull().bg(c.theme.background);
         defer col.end();
         {
-            const bar = ui.div(c).row().itemsCenter().wFull().h(64).px(24);
+            const bar = ui.div(c).row().itemsCenter().wFull().h(header_h).px(24);
             defer bar.end();
-            ui.text(c, s.top_view.label(), .{ .weight = .semibold, .size = 18 });
+            ui.text(c, s.top_view.label(), .{ .weight = .semibold, .size = header_size });
         }
         ui.divider(c);
         const kind = s.top_view.feed() orelse return s.centered(c, "Coming soon");
@@ -1548,6 +1563,7 @@ pub const State = struct {
         row = row.hover(if (is_sel) s.pal.secondary_container else c.theme.surface_hover);
         defer row.end();
         if (row.clicked()) s.pending_select = ch.id;
+        if (row.secondaryClicked()) s.channel_menu.show(ch.id, c.input.mouse.x, c.input.mouse.y);
 
         const name = s.store.channelName(ch);
         const prefix: []const u8 = switch (ch.kind) {
@@ -1618,11 +1634,11 @@ pub const State = struct {
     }
 
     fn topBar(s: *State, c: *ui.Context) void {
-        const bar = ui.div(c).row().itemsCenter().gap(12).wFull().h(64).px(24);
+        const bar = ui.div(c).row().itemsCenter().gap(12).wFull().h(header_h).px(24);
         defer bar.end();
         if (s.cur) |cur| {
             const name = s.store.channelName(cur);
-            ui.textf(c, .{ .weight = .semibold, .size = 18 }, "{s}{s}", .{ if (cur.kind == .channel or cur.kind == .private) "# " else "", name });
+            ui.textf(c, .{ .weight = .semibold, .size = header_size }, "{s}{s}", .{ if (cur.kind == .channel or cur.kind == .private) "# " else "", name });
         }
         ui.spacer(c);
         const st = s.store;
@@ -1989,6 +2005,51 @@ pub const State = struct {
         s.applyChoice(c, choice);
     }
 
+    /// Draws the sidebar row menu (if open) and acts on what it chose
+    fn channelOverlays(s: *State, c: *ui.Context) void {
+        if (!s.channel_menu.anyOpen()) return;
+        const ch = s.store.channel(s.channel_menu.channel()) orelse return s.channel_menu.closeAll();
+        const now = std.Io.Timestamp.now(s.io, .real).toSeconds();
+        const info: channel_menu.Info = .{
+            .kind = ch.kind,
+            .name = s.store.channelName(ch),
+            .starred = ch.place == .starred,
+            .muted = s.store.isMuted(ch, now),
+            .mode = s.store.notifyMode(ch),
+        };
+        const choice = s.channel_menu.draw(c, info) orelse return;
+        const id = ch.id;
+        switch (choice) {
+            .copy_name => {
+                c.clipboard.write(c.clipboard.ctx, info.name);
+                s.toast("Name copied");
+            },
+            .copy_link => {
+                for (s.store.teams.items) |t| if (std.mem.eql(u8, t.id, s.store.active_team)) {
+                    const link = std.fmt.allocPrint(c.alloc(), "{s}/archives/{s}", .{ std.mem.trimEnd(u8, t.url, "/"), id }) catch return;
+                    c.clipboard.write(c.clipboard.ctx, link);
+                    s.toast("Link copied");
+                };
+            },
+            // Shown at once; the network side then reads where Slack put it
+            .star => {
+                ch.place = .starred;
+                s.actions.channel_op(s.actions.ctx, id, .star, "");
+            },
+            .unstar => {
+                ch.place = .none;
+                s.actions.channel_op(s.actions.ctx, id, .unstar, "");
+            },
+            .new_section => |name| s.actions.channel_op(s.actions.ctx, id, .new_section, name),
+            .close => s.actions.channel_op(s.actions.ctx, id, .close, ""),
+            .leave => s.actions.channel_op(s.actions.ctx, id, .leave, ""),
+            .notify_all => s.actions.channel_op(s.actions.ctx, id, .notify_all, ""),
+            .notify_mentions => s.actions.channel_op(s.actions.ctx, id, .notify_mentions, ""),
+            .mute => s.actions.channel_op(s.actions.ctx, id, .mute, ""),
+            .unmute => s.actions.channel_op(s.actions.ctx, id, .unmute, ""),
+        }
+    }
+
     /// Sends a link to the message into the `dest` conversation
     fn forwardTo(s: *State, c: *ui.Context, channel_id: []const u8, m: *const store.Message, dest: []const u8) void {
         const link = s.permalink(c.alloc(), channel_id, m) orelse return;
@@ -2100,9 +2161,9 @@ pub const State = struct {
         defer col.end();
         s.dropZone(c, col.index, &s.thread_attach);
         {
-            const head = ui.div(c).row().itemsCenter().wFull().h(64).px(20);
+            const head = ui.div(c).row().itemsCenter().wFull().h(header_h).px(20);
             defer head.end();
-            ui.text(c, "Thread", .{ .size = 18, .weight = .semibold });
+            ui.text(c, "Thread", .{ .size = header_size, .weight = .semibold });
             ui.spacer(c);
             const close = ui.div(c).w(32).h(32).center().rounded(radius).control().hover(c.theme.surface_hover);
             defer close.end();
