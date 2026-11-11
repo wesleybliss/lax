@@ -2296,3 +2296,39 @@ test "announce: notifies for other conversations, stays quiet for the one on scr
     try std.testing.expectEqualStrings("ada | @U1 see this", last_notice[0..last_notice_len]);
     try std.testing.expectEqual(@as(usize, 0), st.notices.items.len);
 }
+
+test "chat list: its scrollbar thumb drags, though message rows reach the edge" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    var infos: [80]store.MessageInfo = undefined;
+    for (&infos, 0..) |*info, i| {
+        info.* = .{ .ts = try std.fmt.allocPrint(gpa, "{d}.000100", .{1700001000 + i * 30}), .user = "U2", .text = "message number to make the list long enough to scroll around in" };
+    }
+    defer for (infos) |info| gpa.free(info.ts);
+    try st.apply(.{ .history = .{ .channel = "C1", .messages = &infos } });
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..5) |_| t.frame();
+
+    // Wake the bar by hovering near the list's right edge, then find the tallest track
+    t.moveTo(990, 300);
+    var id: u64 = 0;
+    var best: ?@TypeOf(t.ctx.scrollbars.get(0).?) = null;
+    var it = t.ctx.scrollbars.iterator();
+    while (it.next()) |e| if (best == null or e.value_ptr.track_h > best.?.track_h) {
+        best = e.value_ptr.*;
+        id = e.key_ptr.*;
+    };
+    const g = best orelse return error.NoScrollbar;
+    const grab_y = g.thumb_y + g.thumb_h / 2;
+    const before = t.ctx.scroll.get(id) orelse 0;
+    t.drag(g.track_x + 5, grab_y, g.track_x + 5, grab_y - 100);
+    for (0..2) |_| t.frame();
+    const after = t.ctx.scroll.get(id) orelse 0;
+    try std.testing.expect(before - after > 100);
+}

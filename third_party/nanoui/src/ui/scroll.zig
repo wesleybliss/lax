@@ -181,8 +181,11 @@ pub fn tryPressScrollbar(c: *Context) bool {
         }
     }
     const f = found orelse return false;
-    if (c.hot_index != none and c.hot_index < c.nodes.items.len and c.node(c.hot_index).interactive and !isInside(c, f.id, c.hot_index)) return false;
-    if (m.y >= f.g.thumb_y and m.y <= f.g.thumb_y + f.g.thumb_h) {
+    const on_thumb = m.y >= f.g.thumb_y and m.y <= f.g.thumb_y + f.g.thumb_h;
+    // The thumb is painted over whatever is under it, so it wins; only the bare
+    // track gives way to a control (a message row reaches the edge too)
+    if (!on_thumb and c.hot_index != none and c.hot_index < c.nodes.items.len and c.node(c.hot_index).interactive and !isInside(c, f.id, c.hot_index)) return false;
+    if (on_thumb) {
         c.scrollbar_drag = .{ .id = f.id, .grab_dy = m.y - f.g.thumb_y };
     } else {
         // A press on the track moves the thumb to the pointer, then drags.

@@ -101,3 +101,9 @@ family per window theme, fixed at window creation.
 - `linux/desktop.zig`: `readImage` (GDK texture from the clipboard, saved back as PNG), `readFiles` (a `GdkFileList` as paths), and `hasFiles`. GTK 3 still reports none. The reads are waited for on GLib's loop (a second at most) with the state on the heap, since GDK frees the file list's value as soon as the callback returns, and a late callback must not write to a dead stack frame.
 - `linux/gtk.zig`: the GTK 4 table gains the clipboard format, read and texture functions.
 - `linux/surface.zig`: Ctrl+V in a text field leaves files, and empty text, to the view (as with no text), which attaches them.
+
+## Scrollbar thumb wins over a control under it
+
+**Why:** `tryPressScrollbar` let any interactive node under the pointer take the press, so in a list whose rows reach the right edge (Lax's messages) the thumb could not be grabbed. Wheel scrolling was unaffected.
+
+**What:** `ui/scroll.zig`: a press on the thumb always starts the drag; a press on the bare track still gives way to a control flush against the edge.
