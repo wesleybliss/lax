@@ -611,10 +611,8 @@ fn editShortcut(s: *Surface, key: u21) bool {
             defer s.gpa.free(t);
             // A picture alone can read as empty text
             if (t.len == 0) return false;
-            for (t) |*ch| if (ch.* == '\n' or ch.* == '\r') {
-                ch.* = ' ';
-            };
-            var ops = [1]ctx_mod.TextOp{.{ .insert = t }};
+            const clean = @import("../ui/input.zig").pasteText(t, s.ctx.focused_multiline);
+            var ops = [1]ctx_mod.TextOp{.{ .insert = clean }};
             s.ctx.input.ops = &ops;
             s.frame();
             s.ctx.input.ops = &.{};

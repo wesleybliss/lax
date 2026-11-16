@@ -493,6 +493,48 @@ test "links: hand cursor on hover, click opens, text elsewhere keeps the text cu
     try std.testing.expectEqualStrings("https://example.com/run/1", last_link[0..last_link_len]);
 }
 
+test "links: right-click offers Open and Copy link, text elsewhere offers nothing" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    try seedStore(&st);
+    var fake: Fake = .{};
+    var state = app_view.State.init(gpa, std.testing.io, &st, fake.actions());
+    defer state.deinit();
+    state.preferred = "C1";
+    state.opener = fakeOpener;
+    last_link_len = 0;
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..4) |_| t.frame();
+
+    const text = "morning! deploy is green, see the run";
+    const r = t.findText(text).?;
+    const style: ui.TextStyle = .{ .size = 15, .wrap = true, .line_height = 22 };
+    const link_x = r.x + t.ctx.text.caretX(text, style, text.len - 3);
+    const y = r.y + 11;
+
+    // Plain text: no menu
+    t.secondaryClick(r.x + 5, y);
+    for (0..3) |_| t.frame();
+    try std.testing.expect(!t.hasText("Copy link"));
+
+    t.secondaryClick(link_x, y);
+    for (0..3) |_| t.frame();
+    try std.testing.expect(t.hasText("Open link"));
+    try t.clickText("Copy link");
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqualStrings("https://example.com/run/1", t.clipboard.items);
+    try std.testing.expectEqual(@as(usize, 0), last_link_len);
+
+    t.secondaryClick(link_x, y);
+    for (0..3) |_| t.frame();
+    try t.clickText("Open link");
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqualStrings("https://example.com/run/1", last_link[0..last_link_len]);
+}
+
 test "composer pins the text cursor while hovered" {
     const gpa = std.testing.allocator;
     var st = store.Store.init(gpa);
@@ -1573,7 +1615,7 @@ test "pointer in a message row's empty space is an arrow" {
     try std.testing.expect(t.ctx.cursor == null);
 }
 
-test "composer: two lines by default, the border button makes it ten" {
+test "composer: one line until the text wraps or breaks, then shrinks back" {
     const gpa = std.testing.allocator;
     var st = store.Store.init(gpa);
     defer st.deinit();
@@ -1585,20 +1627,28 @@ test "composer: two lines by default, the border button makes it ten" {
     try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
     defer t.deinit();
     for (0..4) |_| t.frame();
-    const small = t.findText("Message #general").?;
-    const toggle = t.findText("▴").?;
-    t.click(toggle.x + 3, toggle.y + 3);
+    const empty = t.findText("Message #general").?;
+    t.click(empty.x + 3, empty.y + 3);
     for (0..3) |_| t.frame();
-    try std.testing.expect(state.composer_expanded);
-    const tall = t.findText("Message #general").?;
-    // Eight more lines of 22 points: the box grew upward
-    try std.testing.expect(small.y - tall.y > 150);
-    try t.screenshot("/tmp/lax-composer-tall.png");
-    const back = t.findText("▾").?;
-    t.click(back.x + 3, back.y + 3);
+    t.typeText("one");
     for (0..3) |_| t.frame();
-    try std.testing.expect(!state.composer_expanded);
-    try std.testing.expectApproxEqAbs(small.y, t.findText("Message #general").?.y, 1);
+    const one = t.findText("one").?;
+    t.textOps(&.{.{ .insert = "\ntwo\nthree" }});
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqualStrings("one\ntwo\nthree", state.main_composer.text());
+    // Two more lines: the first moved up by about two line heights
+    try std.testing.expect(one.y - t.findText("one").?.y > 30);
+    // Past the max it stops growing and scrolls
+    var long: std.ArrayList(u8) = .empty;
+    defer long.deinit(gpa);
+    for (0..30) |_| try long.appendSlice(gpa, "\nline");
+    t.textOps(&.{.{ .insert = long.items }});
+    for (0..3) |_| t.frame();
+    const grown = t.findText("one");
+    try std.testing.expect(grown == null or one.y - grown.?.y < 18 * 24);
+    state.main_composer.clear();
+    for (0..3) |_| t.frame();
+    try std.testing.expectApproxEqAbs(empty.y, t.findText("Message #general").?.y, 1);
 }
 
 test "app update: the rail shows an arrow, a click installs, a failure can be retried" {

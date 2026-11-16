@@ -266,3 +266,32 @@ pub const Input = struct {
         i.shortcut = null;
     }
 };
+
+/// Pasted text made fit for the focused field, in place: in a multiline
+/// field line breaks (`\r\n`, `\r`) become `\n`; in a single-line one they
+/// become spaces. Returns the (possibly shorter) text.
+pub fn pasteText(t: []u8, multiline: bool) []u8 {
+    if (!multiline) {
+        for (t) |*ch| if (ch.* == '\n' or ch.* == '\r') {
+            ch.* = ' ';
+        };
+        return t;
+    }
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < t.len) : (i += 1) {
+        if (t[i] == '\r') {
+            if (i + 1 < t.len and t[i + 1] == '\n') i += 1;
+            t[n] = '\n';
+        } else t[n] = t[i];
+        n += 1;
+    }
+    return t[0..n];
+}
+
+test "pasteText keeps line breaks in multiline fields" {
+    var a = "one\r\ntwo\rthree\nfour".*;
+    try std.testing.expectEqualStrings("one\ntwo\nthree\nfour", pasteText(&a, true));
+    var b = "one\r\ntwo\nthree".*;
+    try std.testing.expectEqualStrings("one  two three", pasteText(&b, false));
+}

@@ -162,10 +162,8 @@ fn editShortcut(s: *Surface, key: u21) bool {
             // No text: the view may take Ctrl+V for something else.
             const t = pasted orelse return false;
             defer s.gpa.free(t);
-            for (t) |*ch| if (ch.* == '\n' or ch.* == '\r') {
-                ch.* = ' ';
-            };
-            var ops = [1]ctx_mod.TextOp{.{ .insert = t }};
+            const clean = @import("../ui/input.zig").pasteText(t, s.ctx.focused_multiline);
+            var ops = [1]ctx_mod.TextOp{.{ .insert = clean }};
             s.ctx.input.ops = &ops;
             s.frame();
             if (!s.dead) s.ctx.input.ops = &.{};
