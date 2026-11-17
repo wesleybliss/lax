@@ -243,6 +243,8 @@ const Fake = struct {
     typing_calls: usize = 0,
     away: ?bool = null,
     feed_calls: usize = 0,
+    inspect_calls: usize = 0,
+    inspect_what: store.Inspect = .details,
     update_calls: usize = 0,
     check_calls: usize = 0,
     feed_kind: ?store.FeedKind = null,
@@ -283,6 +285,7 @@ const Fake = struct {
             .manual = manual,
             .set_presence = setPresence,
             .load_feed = loadFeed,
+            .inspect = inspect,
             .apply_update = applyUpdate,
             .check_update = checkUpdate,
             .update_ctx = f,
@@ -297,6 +300,14 @@ const Fake = struct {
     fn checkUpdate(ctx: *anyopaque) void {
         const f: *Fake = @ptrCast(@alignCast(ctx));
         f.check_calls += 1;
+    }
+
+    fn inspect(ctx: *anyopaque, channel: []const u8, what: store.Inspect, arg: []const u8) void {
+        const f: *Fake = @ptrCast(@alignCast(ctx));
+        f.inspect_calls += 1;
+        f.inspect_what = what;
+        _ = channel;
+        _ = arg;
     }
 
     fn loadFeed(ctx: *anyopaque, kind: store.FeedKind) void {
@@ -1322,9 +1333,8 @@ test "threads page: loads on open, lists a thread, opens it" {
     for (0..3) |_| t.frame();
     try t.clickText("Threads");
     for (0..3) |_| t.frame();
-    // Asked once, nothing shown until Slack answers
-    try std.testing.expectEqual(@as(usize, 1), fake.feed_calls);
-    try std.testing.expectEqual(store.FeedKind.threads, fake.feed_kind.?);
+    // The sidebar asks for Threads and Drafts to bold their rows; opening the page asks no more
+    try std.testing.expectEqual(@as(usize, 2), fake.feed_calls);
     try std.testing.expect(!t.hasText("No threads yet"));
     try st.apply(.{ .feed = .{ .kind = .threads, .entries = &.{.{
         .channel = "C1",
@@ -1342,7 +1352,7 @@ test "threads page: loads on open, lists a thread, opens it" {
     try std.testing.expect(t.hasText("Grace: Can someone review this?"));
     try std.testing.expect(t.hasText("Alex: On it"));
     try t.screenshot("/tmp/lax-threads.png");
-    try std.testing.expectEqual(@as(usize, 1), fake.feed_calls);
+    try std.testing.expectEqual(@as(usize, 2), fake.feed_calls);
     // Clicking the card opens the conversation and its thread
     try t.clickText("Grace: Can someone review this?");
     for (0..3) |_| t.frame();
@@ -1649,6 +1659,51 @@ test "composer: one line until the text wraps or breaks, then shrinks back" {
     state.main_composer.clear();
     for (0..3) |_| t.frame();
     try std.testing.expectApproxEqAbs(empty.y, t.findText("Message #general").?.y, 1);
+}
+
+test "composer: format buttons wrap the selection, the Aa button hides their row" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    state.preferred = "C1";
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..4) |_| t.frame();
+    const empty = t.findText("Message #general").?;
+    t.click(empty.x + 3, empty.y + 3);
+    for (0..3) |_| t.frame();
+    t.typeText("hi there");
+    t.textOps(&.{.{ .command = .select_all }});
+    for (0..3) |_| t.frame();
+    const text = t.findText("hi there").?;
+    // The bold button: first in the row above the text
+    t.click(401, text.y - 37);
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqualStrings("*hi there*", state.main_composer.text());
+    // Italic over the same words
+    t.click(433, text.y - 37);
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqualStrings("*_hi there_*", state.main_composer.text());
+    // The emoji button opens the picker above it; @ types an @ at the caret
+    t.click(465, text.y + 49);
+    for (0..3) |_| t.frame();
+    try std.testing.expect(t.hasText("Search emoji"));
+    t.key(.escape);
+    for (0..3) |_| t.frame();
+    t.click(497, text.y + 49);
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqualStrings("*_@_*", state.main_composer.text());
+    // Aa: the row goes, and comes back
+    t.click(433, text.y + 49);
+    for (0..3) |_| t.frame();
+    try std.testing.expect(!state.settings.format_bar);
+    t.click(433, text.y + 49);
+    for (0..3) |_| t.frame();
+    try std.testing.expect(state.settings.format_bar);
 }
 
 test "app update: the rail shows an arrow, a click installs, a failure can be retried" {
@@ -2482,4 +2537,69 @@ test "chat list: its scrollbar thumb drags, though message rows reach the edge" 
     for (0..2) |_| t.frame();
     const after = t.ctx.scroll.get(id) orelse 0;
     try std.testing.expect(before - after > 100);
+}
+
+test "sidebar: a DM shows its person's status emoji" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    try st.apply(.{ .users = &.{.{ .id = "U2", .name = "Grace", .status_emoji = ":tada:", .status_text = "Shipping" }} });
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..4) |_| t.frame();
+    try std.testing.expect(t.hasText("🎉"));
+}
+
+test "sidebar right-click: conversation details and search" {
+    const gpa = std.testing.allocator;
+    var st = store.Store.init(gpa);
+    defer st.deinit();
+    var fake: Fake = .{};
+    var state = try seedFor(gpa, &st, &fake);
+    defer state.deinit();
+    var t: ui.Tester = undefined;
+    try t.init(gpa, .init(&state, app_view.State.view), .{ .width = 1000, .height = 640, .scale = 1 });
+    defer t.deinit();
+    for (0..3) |_| t.frame();
+
+    const dev = t.findText("dev").?;
+    t.secondaryClick(dev.x + dev.w / 2, dev.y + dev.h / 2);
+    for (0..3) |_| t.frame();
+    try std.testing.expect(t.hasText("Conversation details"));
+    try t.clickText("View conversation details");
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqual(@as(usize, 1), fake.inspect_calls);
+    try std.testing.expectEqual(store.Inspect.details, fake.inspect_what);
+    try std.testing.expect(t.hasText("Loading…"));
+    try st.apply(.{ .details = .{ .channel = "C2", .topic = "Builds and deploys", .purpose = "Dev chatter", .members = 12, .created = 1700000000 } });
+    for (0..3) |_| t.frame();
+    try std.testing.expect(t.hasText("Builds and deploys"));
+    try std.testing.expect(t.hasText("12"));
+    try std.testing.expect(t.hasText("Nov 14, 2023"));
+    try std.testing.expect(t.hasText("C2"));
+    try t.clickText("Copy");
+    t.frame();
+    try std.testing.expectEqualStrings("C2", t.clipboard.items);
+    _ = t.shortcut(.{ .key = ui.Shortcut.escape });
+    t.settle(2);
+    try std.testing.expect(!t.hasText("Builds and deploys"));
+
+    const again = t.findText("dev").?;
+    t.secondaryClick(again.x + again.w / 2, again.y + again.h / 2);
+    for (0..3) |_| t.frame();
+    try t.clickText("Search in conversation");
+    for (0..3) |_| t.frame();
+    t.typeText("deploy");
+    t.key(.enter);
+    for (0..3) |_| t.frame();
+    try std.testing.expectEqual(@as(usize, 2), fake.inspect_calls);
+    try std.testing.expectEqual(store.Inspect.search, fake.inspect_what);
+    try std.testing.expect(t.hasText("Searching…"));
+    try st.apply(.{ .found = .{ .channel = "C2", .query = "in:<#C2> deploy", .entries = &.{.{ .channel = "C2", .ts = "1700000000.000100", .user = "U2", .text = "deploy is green" }} } });
+    for (0..3) |_| t.frame();
+    try std.testing.expect(t.hasText("Grace: deploy is green"));
 }

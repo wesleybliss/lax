@@ -78,7 +78,7 @@ pub const Pending = struct {
         return true;
     }
 
-    fn addPath(p: *Pending, path: []const u8) void {
+    pub fn addPath(p: *Pending, path: []const u8) void {
         if (p.items.items.len >= max_files or p.has(path)) return;
         const owned = p.gpa.dupe(u8, path) catch return;
         p.items.append(p.gpa, owned) catch p.gpa.free(owned);

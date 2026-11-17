@@ -12,6 +12,8 @@ pub const layout = @import("layout.zig");
 pub const settings = @import("settings.zig");
 pub const message_menu = @import("message_menu.zig");
 pub const recents = @import("recents.zig");
+pub const format = @import("format.zig");
+pub const format_bar = @import("format_bar.zig");
 
 test {
     _ = open_url;
@@ -22,6 +24,8 @@ test {
     _ = recents;
     _ = theme;
     _ = composer;
+    _ = format;
+    _ = format_bar;
     _ = attachments;
     _ = @import("tests.zig");
 }

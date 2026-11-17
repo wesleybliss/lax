@@ -19,6 +19,9 @@ const forward_row_h: f32 = 34;
 const forward_max_rows = 120;
 const picker_hits_max = 240;
 
+/// Not a conversation id: what a `Target` names when the picker is for a message box
+const composer_channel = "composer";
+
 /// The message a popup is for, held by value: the list may change under it
 pub const Target = struct {
     channel_buf: [32]u8 = undefined,
@@ -42,6 +45,15 @@ pub const Target = struct {
 
     pub fn ts(t: *const Target) []const u8 {
         return t.ts_buf[0..t.ts_len];
+    }
+
+    /// A target for the message box's emoji button: the box is `which` ("main" or "thread")
+    pub fn composer(which: []const u8) Target {
+        return make(composer_channel, which, false);
+    }
+
+    pub fn isComposer(t: *const Target) bool {
+        return std.mem.eql(u8, t.channel(), composer_channel);
     }
 
     pub fn is(t: *const Target, channel_id: []const u8, message_ts: []const u8, in_thread: bool) bool {
@@ -192,7 +204,7 @@ pub const Menu = struct {
 
     fn picker(m: *Menu, c: *ui.Context) ?[]const u8 {
         if (m.picker_open) m.ensureUnique();
-        const p = kit.popover(c, "emoji-picker", &m.picker_open, m.anchor, .{ .placement = .bottom_end, .width = picker_w, .padding = 8, .gap = 6 }) orelse return null;
+        const p = kit.popover(c, "emoji-picker", &m.picker_open, m.anchor, .{ .placement = if (m.target.isComposer()) .top_start else .bottom_end, .width = picker_w, .padding = 8, .gap = 6 }) orelse return null;
         defer p.end();
         _ = ui.textField(c, &m.query, .{ .caret_color = theme.caretColor(c.theme.dark), .placeholder = "Search emoji", .width = .fill, .size = 14 });
         const hits = m.pickerHits(c.alloc(), std.mem.trim(u8, m.query.text(), " :"));
