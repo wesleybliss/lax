@@ -142,6 +142,11 @@ fn actionPresence(ctx: *anyopaque, away: bool) void {
     net.setPresence(away);
 }
 
+fn actionInspect(ctx: *anyopaque, channel: []const u8, what: store.Inspect, arg: []const u8) void {
+    const net: *Net = @ptrCast(@alignCast(ctx));
+    net.inspect(channel, what, arg);
+}
+
 fn actionFeed(ctx: *anyopaque, kind: store.FeedKind) void {
     const net: *Net = @ptrCast(@alignCast(ctx));
     net.loadFeed(kind);
@@ -207,6 +212,7 @@ fn run(init: std.process.Init, relaunch_path: *?[]const u8) !void {
         .manual = actionManual,
         .set_presence = actionPresence,
         .load_feed = actionFeed,
+        .inspect = actionInspect,
         .update_ctx = &updater,
         .apply_update = actionApplyUpdate,
         .check_update = actionCheckUpdate,

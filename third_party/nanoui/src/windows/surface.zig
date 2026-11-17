@@ -559,10 +559,8 @@ pub const Surface = struct {
                 pasted = @import("desktop.zig").clipboard.readText(self.gpa) catch null;
                 // No text: the view may take Ctrl+V for something else (an image).
                 const t = pasted orelse return false;
-                for (t) |*ch| if (ch.* == '\n' or ch.* == '\r') {
-                    ch.* = ' ';
-                };
-                break :blk .{ .insert = t };
+                const clean = @import("../ui/input.zig").pasteText(t, self.ctx.focused_multiline);
+                break :blk .{ .insert = clean };
             },
             else => return false,
         };

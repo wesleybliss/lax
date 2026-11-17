@@ -32,6 +32,8 @@ pub const Settings = struct {
     chat_size: u16 = 15,
     /// Height of the sidebar's rows in points: the spacing between conversations
     sidebar_row: u16 = row_comfortable,
+    /// The message box shows its formatting buttons
+    format_bar: bool = true,
 
     /// The same settings with every value in range
     pub fn clamped(s: Settings) Settings {

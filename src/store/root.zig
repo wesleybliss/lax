@@ -27,6 +27,9 @@ pub const User = struct {
     is_bot: bool = false,
     /// URL of the profile picture (empty: none)
     image: []const u8 = "",
+    /// Their status emoji as Slack names it (`:books:`; empty: none) and its text
+    status_emoji: []const u8 = "",
+    status_text: []const u8 = "",
 };
 
 /// Where Slack's channel sections put a conversation in the sidebar
@@ -91,6 +94,42 @@ pub const Feed = struct {
     entries: std.ArrayList(FeedEntry) = .empty,
     /// Slack has answered at least once
     loaded: bool = false,
+};
+
+/// What the details dialog shows about a conversation
+pub const DetailsInfo = struct {
+    channel: []const u8,
+    /// A channel's topic and purpose; a DM's job title
+    topic: []const u8 = "",
+    purpose: []const u8 = "",
+    /// Who made the channel (a user id) and when (seconds); 0: unknown
+    creator: []const u8 = "",
+    created: i64 = 0,
+    members: u32 = 0,
+    /// A DM's person: their status text and local time zone name
+    status: []const u8 = "",
+    timezone: []const u8 = "",
+};
+
+pub const Details = struct {
+    channel: []u8,
+    topic: []u8,
+    purpose: []u8,
+    creator: []u8,
+    created: i64,
+    members: u32,
+    status: []u8,
+    timezone: []u8,
+};
+
+/// What a conversation's "Conversation details" menu entries ask for
+pub const Inspect = enum { details, search };
+
+/// The messages found for a search in one conversation
+pub const Found = struct {
+    channel: []u8 = &.{},
+    query: []u8 = &.{},
+    feed: Feed = .{},
 };
 
 /// What the network side knows about a conversation
@@ -317,6 +356,9 @@ pub const Update = union(enum) {
     notify: NotifyInfo,
     /// A top-row page's contents, newest first
     feed: struct { kind: FeedKind, entries: []const FeedEntryInfo },
+    details: DetailsInfo,
+    /// What a search in `channel` for `query` found, newest first
+    found: struct { channel: []const u8, query: []const u8, entries: []const FeedEntryInfo },
     /// The workspaces to switch between, and which one is shown
     teams: struct { list: []const TeamInfo, active: []const u8 },
     /// A workspace's icon (an encoded PNG)
@@ -427,7 +469,7 @@ pub const Channel = struct {
 
 pub const max_messages_per_channel = 1000;
 
-const StoredUser = struct { id: []u8, name: []u8, online: bool = false, is_bot: bool = false, image: []u8 = &.{}, avatar: []u8 = &.{} };
+const StoredUser = struct { id: []u8, name: []u8, online: bool = false, is_bot: bool = false, image: []u8 = &.{}, avatar: []u8 = &.{}, status_emoji: []u8 = &.{}, status_text: []u8 = &.{} };
 
 pub const Team = struct { id: []u8, name: []u8, url: []u8, icon: []u8 = &.{} };
 
@@ -473,6 +515,9 @@ pub const Store = struct {
     /// Messages the UI should announce; it takes them after each batch of updates
     notices: std.ArrayList(Notice) = .empty,
     feeds: [feed_kinds]Feed = @splat(.{}),
+    /// The conversation details last asked for, and the last search's results
+    details: ?Details = null,
+    found: Found = .{},
     /// Filled from the disk cache; the first workspace list confirms or replaces it
     from_cache: bool = false,
     /// A newer release of the app (not tied to a workspace); its strings are owned
@@ -499,6 +544,9 @@ pub const Store = struct {
 
     pub fn deinit(s: *Store) void {
         s.clearAppUpdate();
+        s.clearDetails();
+        s.clearFound();
+        s.found.feed.entries.deinit(s.gpa);
         s.gpa.free(s.active_team);
         if (s.need_manual) |m| s.gpa.free(m);
         if (s.toast) |t| s.gpa.free(t);
@@ -566,6 +614,8 @@ pub const Store = struct {
             s.gpa.free(u.name);
             s.gpa.free(u.image);
             s.gpa.free(u.avatar);
+            s.gpa.free(u.status_emoji);
+            s.gpa.free(u.status_text);
         }
         sp.users.deinit(s.gpa);
         for (sp.channels.items) |*c| s.freeChannel(c);
@@ -583,12 +633,69 @@ pub const Store = struct {
         f.entries.clearRetainingCapacity();
     }
 
+    fn clearDetails(s: *Store) void {
+        const d = s.details orelse return;
+        inline for (.{ d.channel, d.topic, d.purpose, d.creator, d.status, d.timezone }) |str| s.gpa.free(str);
+        s.details = null;
+    }
+
+    fn setDetails(s: *Store, info: DetailsInfo) std.mem.Allocator.Error!void {
+        s.clearDetails();
+        const chan = try s.gpa.dupe(u8, info.channel);
+        errdefer s.gpa.free(chan);
+        const topic = try s.gpa.dupe(u8, info.topic);
+        errdefer s.gpa.free(topic);
+        const purpose = try s.gpa.dupe(u8, info.purpose);
+        errdefer s.gpa.free(purpose);
+        const creator = try s.gpa.dupe(u8, info.creator);
+        errdefer s.gpa.free(creator);
+        const status = try s.gpa.dupe(u8, info.status);
+        errdefer s.gpa.free(status);
+        const timezone = try s.gpa.dupe(u8, info.timezone);
+        errdefer s.gpa.free(timezone);
+        s.details = .{
+            .channel = chan,
+            .topic = topic,
+            .purpose = purpose,
+            .creator = creator,
+            .created = info.created,
+            .members = info.members,
+            .status = status,
+            .timezone = timezone,
+        };
+    }
+
+    fn clearFound(s: *Store) void {
+        s.clearFeed(&s.found.feed);
+        s.found.feed.loaded = false;
+        s.gpa.free(s.found.channel);
+        s.gpa.free(s.found.query);
+        s.found.channel = &.{};
+        s.found.query = &.{};
+    }
+
+    /// Forgets the last search, so the next one shows "Searching…" until it answers
+    pub fn startSearch(s: *Store) void {
+        s.clearFound();
+    }
+
+    fn setFound(s: *Store, chan: []const u8, query: []const u8, infos: []const FeedEntryInfo) std.mem.Allocator.Error!void {
+        s.clearFound();
+        errdefer s.clearFound();
+        s.found.channel = try s.gpa.dupe(u8, chan);
+        s.found.query = try s.gpa.dupe(u8, query);
+        try s.fillFeed(&s.found.feed, infos);
+    }
+
     pub fn feed(s: *const Store, kind: FeedKind) *const Feed {
         return &s.feeds[@intFromEnum(kind)];
     }
 
     fn setFeed(s: *Store, kind: FeedKind, infos: []const FeedEntryInfo) std.mem.Allocator.Error!void {
-        const f = &s.feeds[@intFromEnum(kind)];
+        try s.fillFeed(&s.feeds[@intFromEnum(kind)], infos);
+    }
+
+    fn fillFeed(s: *Store, f: *Feed, infos: []const FeedEntryInfo) std.mem.Allocator.Error!void {
         s.clearFeed(f);
         errdefer s.clearFeed(f);
         try f.entries.ensureTotalCapacity(s.gpa, infos.len);
@@ -782,6 +889,15 @@ pub const Store = struct {
         return if (u.avatar.len > 0) u.avatar else null;
     }
 
+    pub fn statusText(s: *const Store, user_id: []const u8) []const u8 {
+        return if (s.users.get(user_id)) |u| u.status_text else "";
+    }
+
+    /// The emoji of a person's status, as Slack names it (`:books:`); empty when none
+    pub fn statusEmoji(s: *const Store, user_id: []const u8) []const u8 {
+        return if (s.users.get(user_id)) |u| u.status_emoji else "";
+    }
+
     pub fn isOnline(s: *const Store, user_id: []const u8) bool {
         return if (s.users.get(user_id)) |u| u.online else false;
     }
@@ -942,6 +1058,8 @@ pub const Store = struct {
             .sidebar_mode => |m| s.sidebar_mode = m,
             .notify => |n| try s.setNotify(n),
             .feed => |f| try s.setFeed(f.kind, f.entries),
+            .details => |d| try s.setDetails(d),
+            .found => |f| try s.setFound(f.channel, f.query, f.entries),
             .teams => |t| {
                 var fresh: std.ArrayList(Team) = .empty;
                 errdefer {
@@ -1260,6 +1378,8 @@ pub const Store = struct {
             existing.is_bot = user.is_bot;
             // A new picture URL makes the held picture stale; keep it until the new one arrives
             if (user.image.len > 0) try s.replace(&existing.image, user.image);
+            try s.replace(&existing.status_emoji, user.status_emoji);
+            try s.replace(&existing.status_text, user.status_text);
             return;
         }
         const id = try s.gpa.dupe(u8, user.id);
@@ -1268,7 +1388,11 @@ pub const Store = struct {
         errdefer s.gpa.free(name);
         const image = try s.gpa.dupe(u8, user.image);
         errdefer s.gpa.free(image);
-        try s.users.put(s.gpa, id, .{ .id = id, .name = name, .is_bot = user.is_bot, .image = image });
+        const status_emoji = try s.gpa.dupe(u8, user.status_emoji);
+        errdefer s.gpa.free(status_emoji);
+        const status_text = try s.gpa.dupe(u8, user.status_text);
+        errdefer s.gpa.free(status_text);
+        try s.users.put(s.gpa, id, .{ .id = id, .name = name, .is_bot = user.is_bot, .image = image, .status_emoji = status_emoji, .status_text = status_text });
     }
 
     fn upsertChannel(s: *Store, info: ChannelInfo) std.mem.Allocator.Error!void {

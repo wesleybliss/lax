@@ -7,6 +7,8 @@ const slack = @import("slack");
 const store = @import("store");
 const ui = nanoui.ui;
 const theme = @import("theme.zig");
+const format = @import("format.zig");
+const format_bar = @import("format_bar.zig");
 
 const max_items = 8;
 const item_h: f32 = 38;
@@ -38,6 +40,9 @@ pub const Result = struct {
     submitted: ?[]const u8 = null,
     /// Where the text box is (as of this frame), for what sits on its border
     rect: ?ui.Rect = null,
+    /// A button of the rows around the text the app has to act on
+    /// (the ones that only edit the text are done here)
+    action: ?format_bar.Action = null,
 };
 
 pub const Options = struct {
@@ -47,6 +52,11 @@ pub const Options = struct {
     size: f32 = 15,
     /// Enter submits an empty box too (files are waiting to be sent)
     allow_empty: bool = false,
+    /// Slack's box: formatting buttons above the text, and below it the
+    /// attach, emoji and mention buttons with Send
+    rich: bool = false,
+    /// The formatting buttons are showing (with `rich`)
+    format_open: bool = true,
 };
 
 pub const Composer = struct {
@@ -278,6 +288,41 @@ pub const Composer = struct {
         k.index = 0;
     }
 
+    /// The selection as of the last frame (the caret alone if nothing is selected)
+    fn selection(k: *const Composer, c: *ui.Context) [2]usize {
+        const e = c.edits.get(k.buf.last_id) orelse return .{ k.caret, k.caret };
+        return .{ @min(e.anchor, e.caret), @max(e.anchor, e.caret) };
+    }
+
+    /// Applies a formatting button to the selection and gives the text the keyboard back
+    pub fn applyFormat(k: *Composer, c: *ui.Context, kind: format.Kind) void {
+        // A link takes the address on the clipboard, if it holds one
+        var url: ?[]const u8 = null;
+        const pasted = if (kind == .link) (nanoui.clipboard.readText(k.gpa) catch null) else null;
+        defer if (pasted) |p| k.gpa.free(p);
+        if (pasted) |p| {
+            const t = std.mem.trim(u8, p, " \t\r\n");
+            if (std.mem.startsWith(u8, t, "https://") or std.mem.startsWith(u8, t, "http://")) url = t;
+        }
+        const sel = format.apply(k.gpa, &k.buf, k.selection(c), kind, url);
+        k.buf.want_selection = sel;
+        k.caret = sel[1];
+        k.want_focus = true;
+        c.changed = true;
+    }
+
+    /// Types `s` at the caret (over the selection), as the keyboard would
+    pub fn insertAtCaret(k: *Composer, c: *ui.Context, s: []const u8) void {
+        const sel = k.selection(c);
+        const len = k.buf.text().len;
+        const from = @min(sel[0], len);
+        const n = k.buf.replace(from, @min(sel[1], len), s);
+        k.buf.want_caret = from + n;
+        k.caret = from + n;
+        k.want_focus = true;
+        c.changed = true;
+    }
+
     /// The text with picked mentions in Slack's form
     pub fn expand(k: *const Composer, arena: std.mem.Allocator, input: []const u8) []const u8 {
         var out: []const u8 = input;
@@ -326,19 +371,30 @@ pub const Composer = struct {
 
         if (items.len > 0 and k.dismissed == 0) k.popup(c, pal, tok.?, items);
 
-        const box = ui.div(c).wFull();
-        defer box.end();
+        const focused = k.buf.last_id != 0 and c.focus == k.buf.last_id;
+        var frame = ui.div(c).column().wFull();
+        if (opts.rich) frame = frame.rounded(12).clip().bg(c.theme.surface).border(if (focused) c.theme.accent else c.theme.border).borderW(1);
+        defer frame.end();
+        var action: ?format_bar.Action = null;
+        if (opts.rich and opts.format_open) {
+            if (format_bar.top(c)) |kind| k.applyFormat(c, kind);
+            ui.divider(c);
+        }
+        var box = ui.div(c).wFull();
+        if (opts.rich) box = box.px(18).py(14);
         const box_it = box.interaction();
         if (box_it.hovered) c.cursor = .text;
+        if (opts.rich) k.formatKeys(c);
         const res = ui.textArea(c, &k.buf, .{
             .caret_color = theme.caretColor(c.theme.dark),
             .placeholder = opts.placeholder,
-            .bare = false,
+            .bare = opts.rich,
             .min_lines = opts.min_lines,
             .max_lines = @intCast(opts.max_lines),
             .size = opts.size,
             .submit_on_return = items.len == 0 or k.dismissed != 0,
         });
+        box.end();
         k.caret = res.caret;
         if (k.want_focus) {
             k.want_focus = false;
@@ -350,7 +406,27 @@ pub const Composer = struct {
             const trimmed = std.mem.trim(u8, k.buf.text(), " \t\r\n");
             if (trimmed.len > 0) out.submitted = k.expand(arena, trimmed) else if (opts.allow_empty) out.submitted = "";
         }
+        if (opts.rich) {
+            const can_send = std.mem.trim(u8, k.buf.text(), " \t\r\n").len > 0 or opts.allow_empty;
+            action = format_bar.bottom(c, .{ .format_open = opts.format_open, .can_send = can_send });
+        }
+        if (action) |a| switch (a) {
+            .mention => k.insertAtCaret(c, "@"),
+            .send => {
+                const trimmed = std.mem.trim(u8, k.buf.text(), " \t\r\n");
+                out.submitted = if (trimmed.len > 0) k.expand(arena, trimmed) else "";
+            },
+            else => out.action = a,
+        };
         return out;
+    }
+
+    /// Ctrl+B and Ctrl+I in the box (⌘ on a Mac)
+    fn formatKeys(k: *Composer, c: *ui.Context) void {
+        if (k.buf.last_id == 0 or c.focus != k.buf.last_id) return;
+        inline for (.{ .{ 'b', format.Kind.bold }, .{ 'i', format.Kind.italic } }) |pair| {
+            if (c.shortcut(.{ .key = pair[0], .ctrl = true }) or c.shortcut(.{ .key = pair[0], .cmd = true })) k.applyFormat(c, pair[1]);
+        }
     }
 
     fn popup(k: *Composer, c: *ui.Context, pal: theme.Palette, tok: Token, items: []const Candidate) void {

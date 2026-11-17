@@ -11,11 +11,13 @@ const theme = @import("theme.zig");
 const open_url = @import("open_url.zig");
 const notify = @import("notify.zig");
 const composer_mod = @import("composer.zig");
+const format_bar = @import("format_bar.zig");
 const attachments = @import("attachments.zig");
 const layout_mod = @import("layout.zig");
 const settings_mod = @import("settings.zig");
 const message_menu = @import("message_menu.zig");
 const channel_menu = @import("channel_menu.zig");
+const link_menu = @import("link_menu.zig");
 const recents_mod = @import("recents.zig");
 
 const mrkdwn = slack.mrkdwn;
@@ -33,8 +35,7 @@ const sidebar_max: f32 = 520;
 /// A layout change is saved once it has not moved for this long
 const layout_settle_default_ms = 600;
 const handle_w: f32 = 6;
-const composer_lines: u8 = 2;
-const composer_tall_lines: u8 = 10;
+const composer_max_lines: u8 = 18;
 /// DMs quiet for longer than this fold away behind "Show older"
 const rail_w: f32 = 76;
 const font_row_h: f32 = 32;
@@ -116,6 +117,8 @@ pub const Actions = struct {
     download: *const fn (ctx: *anyopaque, name: []const u8, url: []const u8) void,
     /// Load (or refresh) one of the top-row pages
     load_feed: *const fn (ctx: *anyopaque, kind: store.FeedKind) void,
+    /// Ask for a conversation's details, or search it (the argument: Slack's query)
+    inspect: *const fn (ctx: *anyopaque, channel: []const u8, what: store.Inspect, arg: []const u8) void,
     /// A sidebar context menu entry on a conversation (the argument: a new section's name)
     channel_op: *const fn (ctx: *anyopaque, channel: []const u8, op: store.ChannelOp, arg: []const u8) void,
     /// Download and install the announced app update (`store.app_update`)
@@ -274,8 +277,6 @@ pub const State = struct {
     show_hidden_dms: bool = false,
     show_hidden_chans: bool = false,
     show_hidden_apps: bool = false,
-    /// The message box is tall (10 lines) instead of 2
-    composer_expanded: bool = false,
     settings: settings_mod.Settings = .{},
     /// Owns the strings of `settings`
     settings_arena: std.heap.ArenaAllocator,
@@ -313,6 +314,8 @@ pub const State = struct {
     menu: message_menu.Menu,
     /// What a right-click on a sidebar row opens
     channel_menu: channel_menu.Menu = .{},
+    /// What a right-click on a link in a message opens
+    link_menu: link_menu.Menu,
     /// The emoji reacted with last
     recents: recents_mod.Recents = .{},
     /// Brief confirmations ("Link copied")
@@ -325,7 +328,7 @@ pub const State = struct {
     notifier: notify.Sender = notify.send,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, st: *store.Store, actions: Actions) State {
-        return .{ .gpa = gpa, .io = io, .store = st, .actions = actions, .list = .{ .gpa = gpa }, .main_composer = .init(gpa), .thread_composer = .init(gpa), .main_attach = .init(gpa), .thread_attach = .init(gpa), .settings_arena = .init(gpa), .themes_arena = .init(gpa), .menu = .init(gpa), .toaster = .{ .gpa = gpa }, .edit_composer = .init(gpa) };
+        return .{ .gpa = gpa, .io = io, .store = st, .actions = actions, .list = .{ .gpa = gpa }, .main_composer = .init(gpa), .thread_composer = .init(gpa), .main_attach = .init(gpa), .thread_attach = .init(gpa), .settings_arena = .init(gpa), .themes_arena = .init(gpa), .menu = .init(gpa), .link_menu = .init(gpa), .toaster = .{ .gpa = gpa }, .edit_composer = .init(gpa) };
     }
 
     pub fn deinit(s: *State) void {
@@ -346,6 +349,7 @@ pub const State = struct {
         s.edit_composer.deinit();
         s.menu.deinit();
         s.channel_menu.deinit();
+        s.link_menu.deinit();
         s.toaster.deinit();
         s.settings_arena.deinit();
         s.themes_arena.deinit();
@@ -578,6 +582,7 @@ pub const State = struct {
         }
         s.messageOverlays(c);
         s.channelOverlays(c);
+        s.linkOverlays(c);
         s.previewOverlay(c);
         s.toaster.view(c);
 
@@ -626,6 +631,7 @@ pub const State = struct {
         s.cancelEdit();
         s.menu.closeAll();
         s.channel_menu.closeAll();
+        s.link_menu.closeAll();
         s.dropImages();
         // The command-line channel only makes sense for the first workspace
         s.preferred = null;
@@ -959,6 +965,8 @@ pub const State = struct {
     }
 
     fn settingsPage(s: *State, c: *ui.Context) void {
+        // Its own identity: the chat list's scroll position must not carry over
+        ui.key(c, "settings-page");
         const page = ui.div(c).column().grow().hFull().bg(c.theme.background);
         defer page.end();
         {
@@ -1275,6 +1283,9 @@ pub const State = struct {
 
         const filtering = s.filter.text().len > 0;
         if (!filtering) s.topRows(c);
+        // The rows bold themselves from these, so they are kept fresh while the sidebar shows
+        s.refreshFeed(.threads);
+        s.refreshFeed(.drafts);
 
         const st = s.store;
         var lists: [6]std.ArrayList(*store.Channel) = @splat(.empty);
@@ -1389,6 +1400,7 @@ pub const State = struct {
     fn topRows(s: *State, c: *ui.Context) void {
         inline for (.{ TopView.threads, TopView.huddles, TopView.drafts, TopView.saved }) |v| {
             const active = s.top_view == v;
+            const attention = s.needsAttention(v);
             var row = ui.div(c).row().itemsCenter().gap(10).wFull().h(s.rowH()).px(16).control().rounded(radius);
             if (active) row = row.bg(s.pal.secondary_container);
             row = row.hover(if (active) s.pal.secondary_container else c.theme.surface_hover);
@@ -1398,11 +1410,32 @@ pub const State = struct {
                 s.settings_open = false;
             }
             const icon = ui.div(c).w(nav_icon).h(s.rowH()).center();
-            const tint = if (active) c.theme.text else c.theme.muted;
+            const tint = if (active or attention) c.theme.text else c.theme.muted;
             _ = ui.svg(c, .{ .key = v.label(), .bytes = v.svg(), .size = 18, .color = tint });
             icon.end();
-            ui.text(c, v.label(), .{ .size = 15, .weight = if (active) .semibold else .regular, .color = if (active) c.theme.text else c.theme.muted });
+            const weight: ui.Weight = if (attention) .bold else if (active) .semibold else .regular;
+            ui.text(c, v.label(), .{ .size = 15, .weight = weight, .color = tint });
         }
+    }
+
+    /// Threads with unread replies, or drafts waiting to be sent: its row is bold
+    fn needsAttention(s: *State, v: TopView) bool {
+        const kind = v.feed() orelse return false;
+        for (s.store.feed(kind).entries.items) |e| switch (kind) {
+            .threads => if (e.unread) return true,
+            .drafts => if (std.mem.eql(u8, e.note, "Draft")) return true,
+            .saved => {},
+        };
+        return false;
+    }
+
+    /// Asks for a page's entries again when they are older than `feed_refresh_ms`
+    fn refreshFeed(s: *State, kind: store.FeedKind) void {
+        const idx = @intFromEnum(kind);
+        const now = store.nowMs(s.io);
+        if (s.feed_asked_ms[idx] != 0 and now - s.feed_asked_ms[idx] <= feed_refresh_ms) return;
+        s.feed_asked_ms[idx] = now;
+        s.actions.load_feed(s.actions.ctx, kind);
     }
 
     /// The page behind a top row
@@ -1416,12 +1449,7 @@ pub const State = struct {
         }
         ui.divider(c);
         const kind = s.top_view.feed() orelse return s.centered(c, "Coming soon");
-        const idx = @backingInt(kind);
-        const now = store.nowMs(s.io);
-        if (s.feed_asked_ms[idx] == 0 or now - s.feed_asked_ms[idx] > feed_refresh_ms) {
-            s.feed_asked_ms[idx] = now;
-            s.actions.load_feed(s.actions.ctx, kind);
-        }
+        s.refreshFeed(kind);
         const feed = s.store.feed(kind);
         if (!feed.loaded) return s.loading(c);
         if (feed.entries.items.len == 0) return s.centered(c, switch (kind) {
@@ -1450,15 +1478,26 @@ pub const State = struct {
             ui.textf(c, .{ .weight = .semibold, .size = 14, .truncate = .ellipsis }, "{s}{s}", .{ prefix, if (name.len > 0) name else "Conversation" });
             ui.spacer(c);
             if (e.unread) ui.div(c).w(8).h(8).roundedFull().circular().bg(c.theme.accent).end();
-            var tm: Tm = undefined;
-            const secs = tsSeconds(e.ts);
-            if (localtime_r(&secs, &tm) != null) {
-                ui.textf(c, .{ .color = c.theme.muted, .size = 12 }, "{s} {d}, {d:0>2}:{d:0>2}", .{ monthName(tm.mon), @as(u32, @intCast(tm.mday)), @as(u32, @intCast(tm.hour)), @as(u32, @intCast(tm.min)) });
-            }
+            s.stamp(c, e.ts);
         }
         if (e.text.len > 0) s.feedLine(c, e.user, e.text, c.theme.text) else ui.text(c, "Message not available", .{ .size = 14, .color = c.theme.muted });
         if (e.reply_text.len > 0) s.feedLine(c, e.reply_user, e.reply_text, c.theme.muted);
         if (e.note.len > 0) ui.text(c, e.note, .{ .size = 12, .weight = .semibold, .color = s.pal.link });
+    }
+
+    /// A message's time as "Nov 6, 09:41", small and muted
+    fn stamp(_: *State, c: *ui.Context, ts: []const u8) void {
+        var tm: Tm = undefined;
+        const secs = tsSeconds(ts);
+        if (localtime_r(&secs, &tm) == null) return;
+        ui.textf(c, .{ .color = c.theme.muted, .size = 12 }, "{s} {d}, {d:0>2}:{d:0>2}", .{ monthName(tm.mon), @as(u32, @intCast(tm.mday)), @as(u32, @intCast(tm.hour)), @as(u32, @intCast(tm.min)) });
+    }
+
+    /// One message found by the conversation search
+    fn drawFound(ctx: *anyopaque, c: *ui.Context, e: *const store.FeedEntry) void {
+        const s: *State = @ptrCast(@alignCast(ctx));
+        s.stamp(c, e.ts);
+        s.feedLine(c, e.user, e.text, c.theme.text);
     }
 
     /// "Name: message" as plain text, cut short
@@ -1581,12 +1620,23 @@ pub const State = struct {
         const weight: ui.Weight = if (ch.unread) .bold else .regular;
         ui.text(c, if (name.len == 0) ch.id else name, .{ .size = 15, .weight = weight, .color = tone, .truncate = .ellipsis });
         if (s.store.isSelfDm(ch)) ui.text(c, "you", .{ .size = 13, .color = c.theme.muted });
+        if (ch.kind == .im) s.statusIcon(c, ch);
         ui.spacer(c);
         if (ch.mentions > 0) {
             const badge = ui.div(c).h(20).px(7).center().rounded(6).bg(c.theme.accent);
             ui.textf(c, .{ .size = 12, .weight = .bold, .color = c.theme.accent_text }, "{d}", .{ch.mentions});
             badge.end();
         } else if (ch.unread) ui.div(c).w(8).h(8).roundedFull().circular().bg(c.theme.accent).end();
+    }
+
+    /// The emoji of the other person's status, after their name (custom emoji have no glyph here)
+    fn statusIcon(s: *State, c: *ui.Context, ch: *const store.Channel) void {
+        const uid = ch.user_id orelse return;
+        const shortcode = std.mem.trim(u8, s.store.statusEmoji(uid), ":");
+        if (shortcode.len == 0) return;
+        var buf: [32]u8 = undefined;
+        const glyph = slack.emoji.forReaction(&buf, shortcode) orelse return;
+        ui.text(c, c.print("{s}", .{glyph}), .{ .size = 14 });
     }
 
     /// The person's picture with a presence dot on its corner: filled when active, a ring when away
@@ -1911,7 +1961,10 @@ pub const State = struct {
     /// the overflow menu
     fn toolbar(s: *State, c: *ui.Context, rect: ui.Rect, m: *const store.Message, channel_id: []const u8, in_thread: bool) void {
         var names: [recents_mod.max + recents_mod.defaults.len][]const u8 = undefined;
-        const n_names = s.recents.top(&names);
+        // `names` are slices of the recents' storage, and a click below
+        // reshuffles it mid-loop, so they must point into a snapshot instead
+        const snapshot = s.recents;
+        const n_names = snapshot.top(&names);
         var shown: [bar_recent][]const u8 = undefined;
         var n_shown: usize = 0;
         for (names[0..n_names]) |name| {
@@ -1932,7 +1985,7 @@ pub const State = struct {
             const btn = barButton(c);
             defer btn.end();
             if (btn.clicked()) s.react(channel_id, m.ts, name, !hasMine(m, name));
-            ui.text(c, slack.emoji.lookup(name).?, .{ .size = 17 });
+            ui.text(c, slack.emoji.lookup(name) orelse name, .{ .size = 17 });
         }
         if (s.barIcon(c, "🙂", "Add reaction")) |at| s.toggleMenu(.picker, target, at);
         if (!in_thread) {
@@ -1995,6 +2048,7 @@ pub const State = struct {
     /// Draws the open toolbar popup (if any) and acts on what it chose
     fn messageOverlays(s: *State, c: *ui.Context) void {
         var info: message_menu.Info = .{ .own = false, .preview = "" };
+        if (s.menu.target.isComposer()) return s.composerOverlays(c, info);
         if (s.menu.anyOpen()) {
             if (s.findMessage(s.menu.target)) |m| {
                 const r = mrkdwn.render(c.alloc(), m.text, s.resolver()) catch mrkdwn.Rendered{ .text = m.text, .runs = &.{} };
@@ -2005,12 +2059,27 @@ pub const State = struct {
         s.applyChoice(c, choice);
     }
 
+    /// The emoji picker the message box opened: the emoji chosen is typed into the box
+    fn composerOverlays(s: *State, c: *ui.Context, info: message_menu.Info) void {
+        const choice = s.menu.draw(c, s.store, s.pal, info) orelse return;
+        const name = switch (choice) {
+            .react => |n| n,
+            else => return,
+        };
+        const box = if (std.mem.eql(u8, s.menu.target.ts(), "thread")) &s.thread_composer else &s.main_composer;
+        box.insertAtCaret(c, c.print(":{s}: ", .{name}));
+    }
+
     /// Draws the sidebar row menu (if open) and acts on what it chose
     fn channelOverlays(s: *State, c: *ui.Context) void {
         if (!s.channel_menu.anyOpen()) return;
         const ch = s.store.channel(s.channel_menu.channel()) orelse return s.channel_menu.closeAll();
         const now = std.Io.Timestamp.now(s.io, .real).toSeconds();
         const info: channel_menu.Info = .{
+            .store = s.store,
+            .results = .{ .ctx = s, .draw = drawFound },
+            .id = ch.id,
+            .user_id = ch.user_id,
             .kind = ch.kind,
             .name = s.store.channelName(ch),
             .starred = ch.place == .starred,
@@ -2020,9 +2089,18 @@ pub const State = struct {
         const choice = s.channel_menu.draw(c, info) orelse return;
         const id = ch.id;
         switch (choice) {
+            .details => s.actions.inspect(s.actions.ctx, id, .details, ""),
+            .search => |query| {
+                s.store.startSearch();
+                s.actions.inspect(s.actions.ctx, id, .search, query);
+            },
             .copy_name => {
                 c.clipboard.write(c.clipboard.ctx, info.name);
                 s.toast("Name copied");
+            },
+            .copy_id => {
+                c.clipboard.write(c.clipboard.ctx, id);
+                s.toast("ID copied");
             },
             .copy_link => {
                 for (s.store.teams.items) |t| if (std.mem.eql(u8, t.id, s.store.active_team)) {
@@ -2047,6 +2125,18 @@ pub const State = struct {
             .notify_mentions => s.actions.channel_op(s.actions.ctx, id, .notify_mentions, ""),
             .mute => s.actions.channel_op(s.actions.ctx, id, .mute, ""),
             .unmute => s.actions.channel_op(s.actions.ctx, id, .unmute, ""),
+        }
+    }
+
+    /// Draws the link menu (if open) and acts on what it chose
+    fn linkOverlays(s: *State, c: *ui.Context) void {
+        const choice = s.link_menu.draw(c, open_url.isOpenable(s.link_menu.url)) orelse return;
+        switch (choice) {
+            .open => s.opener(s.gpa, s.io, s.link_menu.url),
+            .copy => {
+                c.clipboard.write(c.clipboard.ctx, s.link_menu.url);
+                s.toast("Link copied");
+            },
         }
     }
 
@@ -2183,7 +2273,14 @@ pub const State = struct {
         s.thread_attach.view(c, s.pal);
         const bar = ui.div(c).row().wFull().px(16).py(12);
         defer bar.end();
-        const res = s.thread_composer.view(c, s.store, s.pal, .{ .placeholder = "Reply…", .max_lines = 6, .allow_empty = !s.thread_attach.isEmpty() });
+        const res = s.thread_composer.view(c, s.store, s.pal, .{
+            .placeholder = "Reply…",
+            .max_lines = 6,
+            .allow_empty = !s.thread_attach.isEmpty(),
+            .rich = true,
+            .format_open = s.settings.format_bar,
+        });
+        if (res.action) |a| s.composerAction(c, a, "thread", &s.thread_attach);
         if (res.submitted) |text| {
             s.submit(t.channel, text, t.ts, &s.thread_attach);
             s.thread_composer.clear();
@@ -2242,6 +2339,7 @@ pub const State = struct {
                 const x1 = rect.x + c.text.caretX(text[line.start..line.end], s.bodyStyle(), b - line.start);
                 if (m.x >= x0 and m.x < x1) {
                     c.cursor = .hand;
+                    if (it.secondary_clicked) s.link_menu.show(l.target, m.x, m.y);
                     if (it.clicked) s.opener(s.gpa, s.io, l.target);
                     return;
                 }
@@ -2256,9 +2354,15 @@ pub const State = struct {
         const bar = ui.div(c).row().wFull().px(20).pb(16);
         defer bar.end();
         const placeholder = if (s.cur) |cur| c.print("Message {s}{s}", .{ if (cur.kind == .channel or cur.kind == .private) "#" else "", s.store.channelName(cur) }) else "Message";
-        const lines: u8 = if (s.composer_expanded) composer_tall_lines else composer_lines;
-        const res = s.main_composer.view(c, s.store, s.pal, .{ .placeholder = placeholder, .min_lines = lines, .max_lines = lines, .allow_empty = !s.main_attach.isEmpty() });
-        if (res.rect) |rect| s.expandToggle(c, rect);
+        // One line that grows with the text, up to the max, then scrolls
+        const res = s.main_composer.view(c, s.store, s.pal, .{
+            .placeholder = placeholder,
+            .max_lines = composer_max_lines,
+            .allow_empty = !s.main_attach.isEmpty(),
+            .rich = true,
+            .format_open = s.settings.format_bar,
+        });
+        if (res.action) |a| s.composerAction(c, a, "main", &s.main_attach);
         if (res.changed and s.main_composer.text().len > 0) s.signalTyping();
         if (res.submitted) |text| {
             if (s.selected) |id| {
@@ -2266,6 +2370,24 @@ pub const State = struct {
                 s.list.stickToEnd();
             }
             s.main_composer.clear();
+        }
+    }
+
+    /// A button under the message box that is the app's to act on
+    fn composerAction(s: *State, c: *ui.Context, action: format_bar.Action, which: []const u8, files: *attachments.Pending) void {
+        _ = c;
+        switch (action) {
+            .attach => {
+                const picked = nanoui.dialog.open(s.gpa, .{ .title = "Attach files", .button = "Attach", .multiple = true }) catch null orelse return;
+                defer nanoui.dialog.freePaths(s.gpa, picked);
+                for (picked) |path| files.addPath(path);
+            },
+            .toggle_format => {
+                s.settings.format_bar = !s.settings.format_bar;
+                s.saveSettings();
+            },
+            .emoji => |at| s.menu.show(.picker, message_menu.Target.composer(which), at),
+            .mention, .send => {},
         }
     }
 
@@ -2300,16 +2422,6 @@ pub const State = struct {
         const veil = ui.div(c).fixed().offset(r.x + 8, r.y + 8).layer(30).w(r.w - 16).h(r.h - 16).center().rounded(12).bg(c.theme.accent.alpha(0.1)).border(c.theme.accent).borderW(2);
         defer veil.end();
         ui.text(c, "Drop to attach", .{ .size = 18, .weight = .semibold, .color = c.theme.accent });
-    }
-
-    /// A small button on the message box's top border: 2 lines or 10
-    fn expandToggle(s: *State, c: *ui.Context, rect: ui.Rect) void {
-        const w: f32 = 32;
-        const h: f32 = 20;
-        const btn = ui.div(c).fixed().offset(rect.x + rect.w - w - 14, rect.y - h / 2).layer(20).w(w).h(h).center().rounded(6).control().bg(s.pal.container_high).border(c.theme.border).borderW(1).hover(c.theme.surface_hover);
-        defer btn.end();
-        if (btn.clicked()) s.composer_expanded = !s.composer_expanded;
-        ui.text(c, if (s.composer_expanded) "▾" else "▴", .{ .size = 12, .color = c.theme.muted });
     }
 
     /// Tells Slack we are typing, at most every few seconds

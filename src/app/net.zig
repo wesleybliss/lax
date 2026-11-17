@@ -45,6 +45,8 @@ pub const Command = union(enum) {
     presence: bool,
     /// Load a top-row page (Threads, Drafts & sent, Saved)
     feed: store.FeedKind,
+    /// The details of a conversation, or a search in it (`arg`: Slack's query)
+    inspect: struct { channel: []u8, what: store.Inspect, arg: []u8 },
     /// Credentials the user pasted
     manual: struct { url: []u8, token: []u8, cookie: []u8 },
     quit,
@@ -98,6 +100,10 @@ pub const Command = union(enum) {
                 gpa.free(m.ts);
             },
             .channel_op => |m| {
+                gpa.free(m.channel);
+                gpa.free(m.arg);
+            },
+            .inspect => |m| {
                 gpa.free(m.channel);
                 gpa.free(m.arg);
             },
@@ -324,6 +330,12 @@ pub const Net = struct {
         const ch = n.gpa.dupe(u8, channel) catch return;
         const a = n.gpa.dupe(u8, arg) catch return n.gpa.free(ch);
         n.commands.push(n.gpa, n.io, .{ .channel_op = .{ .channel = ch, .op = op, .arg = a } }) catch {};
+    }
+
+    pub fn inspect(n: *Net, channel: []const u8, what: store.Inspect, arg: []const u8) void {
+        const ch = n.gpa.dupe(u8, channel) catch return;
+        const a = n.gpa.dupe(u8, arg) catch return n.gpa.free(ch);
+        n.commands.push(n.gpa, n.io, .{ .inspect = .{ .channel = ch, .what = what, .arg = a } }) catch {};
     }
 
     pub fn typing(n: *Net, channel: []const u8) void {
@@ -1274,6 +1286,72 @@ pub const Net = struct {
         }
     }
 
+    /// What a conversation is about: topic, purpose, size, and for a DM the person
+    fn fetchDetails(n: *Net, api: *slack.http.Api, channel: []const u8) SessionError!void {
+        var tmp = std.heap.ArenaAllocator.init(n.gpa);
+        defer tmp.deinit();
+        const ta = tmp.allocator();
+        const res = api.call(ta, "conversations.info", &.{ .{ "channel", channel }, .{ "include_num_members", "true" } }) catch |err| return n.apiFailed(api, "conversations.info", err);
+        const info = json.obj(res.object, "channel") orelse return;
+        var details: store.DetailsInfo = .{ .channel = channel };
+        if (json.obj(info, "topic")) |t| details.topic = json.str(t, "value") orelse "";
+        if (json.obj(info, "purpose")) |p| details.purpose = json.str(p, "value") orelse "";
+        details.creator = json.str(info, "creator") orelse "";
+        details.created = json.int(info, "created") orelse 0;
+        details.members = if (json.int(info, "num_members")) |m| std.math.cast(u32, m) orelse 0 else 0;
+        if (json.flag(info, "is_im")) {
+            if (json.str(info, "user")) |uid| {
+                if (api.call(ta, "users.info", &.{.{ "user", uid }})) |ures| {
+                    if (json.obj(ures.object, "user")) |user| {
+                        details.timezone = json.str(user, "tz_label") orelse "";
+                        if (json.obj(user, "profile")) |profile| {
+                            details.topic = json.str(profile, "title") orelse "";
+                            details.status = json.str(profile, "status_text") orelse "";
+                        }
+                    }
+                } else |err| if (err == error.Aborted) return n.apiFailed(api, "users.info", err);
+            }
+        }
+        // The update outlives `tmp`, so it carries its own copies
+        var arena = std.heap.ArenaAllocator.init(n.gpa);
+        errdefer arena.deinit();
+        const aa = arena.allocator();
+        inline for (.{ "channel", "topic", "purpose", "creator", "status", "timezone" }) |field| {
+            @field(details, field) = try aa.dupe(u8, @field(details, field));
+        }
+        n.emit(.{ .arena = arena, .update = .{ .details = details } });
+    }
+
+    /// Messages matching `query` (Slack's own search syntax), newest first
+    fn searchMessages(n: *Net, api: *slack.http.Api, channel: []const u8, query: []const u8) SessionError!void {
+        var item_arena = std.heap.ArenaAllocator.init(n.gpa);
+        errdefer item_arena.deinit();
+        const ia = item_arena.allocator();
+        var tmp = std.heap.ArenaAllocator.init(n.gpa);
+        defer tmp.deinit();
+        var out: std.ArrayList(store.FeedEntryInfo) = .empty;
+        const params: []const slack.http.Param = &.{ .{ "query", query }, .{ "count", "20" }, .{ "sort", "timestamp" }, .{ "sort_dir", "desc" } };
+        if (api.call(tmp.allocator(), "search.messages", params)) |res| {
+            const found = json.obj(res.object, "messages");
+            for (if (found) |f| json.arr(f, "matches") else &.{}) |mv| {
+                if (mv != .object) continue;
+                const o = mv.object;
+                try out.append(ia, .{
+                    .channel = try ia.dupe(u8, channel),
+                    .ts = try ia.dupe(u8, json.str(o, "ts") orelse ""),
+                    .thread_ts = "",
+                    .user = try ia.dupe(u8, json.str(o, "user") orelse json.str(o, "username") orelse ""),
+                    .text = try ia.dupe(u8, json.str(o, "text") orelse ""),
+                });
+            }
+        } else |err| {
+            // The dialog says "Nothing found"; the reason goes to the status line
+            if (err == error.Aborted) return n.apiFailed(api, "search.messages", err);
+            if (err == error.SlackError) n.emitStatus("Search failed: {s}", .{api.diag.slackError()});
+        }
+        n.emit(.{ .arena = item_arena, .update = .{ .found = .{ .channel = try ia.dupe(u8, channel), .query = try ia.dupe(u8, query), .entries = out.items } } });
+    }
+
     /// Drafts & sent: your drafts, scheduled messages and sent ones
     fn draftsFeed(n: *Net, api: *slack.http.Api, tmp: std.mem.Allocator, ia: std.mem.Allocator, out: *std.ArrayList(store.FeedEntryInfo)) SessionError!void {
         const res = api.call(tmp, "drafts.list", &.{}) catch |err| return n.apiFailed(api, "drafts.list", err);
@@ -1493,6 +1571,10 @@ pub const Net = struct {
                     .edit => |m| try n.callMessage(api, "chat.update", "Edit", &.{ .{ "channel", m.channel }, .{ "ts", m.ts }, .{ "text", m.text } }),
                     .delete => |m| try n.callMessage(api, "chat.delete", "Delete", &.{ .{ "channel", m.channel }, .{ "ts", m.ts } }),
                     .channel_op => |m| try n.runChannelOp(api, m.channel, m.op, m.arg),
+                    .inspect => |m| switch (m.what) {
+                        .details => n.fetchDetails(api, m.channel) catch |e| try soft(e),
+                        .search => n.searchMessages(api, m.channel, m.arg) catch |e| try soft(e),
+                    },
                     .save => |m| try n.callMessage(api, "saved.add", "Save", &.{ .{ "item_type", "message" }, .{ "item_id", m.channel }, .{ "ts", m.ts } }),
                     .typing => |ch| n.sendTyping(sock, ch),
                     .manual => {},
@@ -1795,7 +1877,16 @@ fn userOf(arena: std.mem.Allocator, o: std.json.ObjectMap) std.mem.Allocator.Err
     const real = if (profile) |p| json.str(p, "real_name") orelse "" else "";
     const name = if (display.len > 0) display else if (real.len > 0) real else json.str(o, "name") orelse id;
     const image = if (profile) |p| json.str(p, "image_72") orelse json.str(p, "image_48") orelse "" else "";
-    return .{ .id = try arena.dupe(u8, id), .name = try arena.dupe(u8, name), .is_bot = json.flag(o, "is_bot") or json.flag(o, "is_app_user"), .image = try arena.dupe(u8, image) };
+    const status_emoji = if (profile) |p| json.str(p, "status_emoji") orelse "" else "";
+    const status_text = if (profile) |p| json.str(p, "status_text") orelse "" else "";
+    return .{
+        .id = try arena.dupe(u8, id),
+        .name = try arena.dupe(u8, name),
+        .is_bot = json.flag(o, "is_bot") or json.flag(o, "is_app_user"),
+        .image = try arena.dupe(u8, image),
+        .status_emoji = try arena.dupe(u8, status_emoji),
+        .status_text = try arena.dupe(u8, status_text),
+    };
 }
 
 fn normalizeUrl(gpa: std.mem.Allocator, input: []const u8) std.mem.Allocator.Error![]u8 {
